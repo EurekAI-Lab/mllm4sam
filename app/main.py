@@ -1,12 +1,11 @@
-# /home/dbcloud/PycharmProjects/mllm4sam/app/main.py
+# app/main.py
 # Copyright (c) 2024, NVIDIA CORPORATION.
 # All rights reserved.
 #
-# NVIDIA CORPORATION and its licensors retain all intellectual property
-# and proprietary rights in and to this software, related documentation
-# and any modifications thereto. Any use, reproduction, disclosure or
-# distribution of this software and related documentation without an express
-# license agreement from NVIDIA CORPORATION is strictly prohibited.
+# This main script loads your config, prepares the dataset, sets up the SFT-based Trainer,
+# and launches the fine-tuning for Qwen2-VL with TRL. The code supports pointing out wound areas
+# using a minimal example of "point-based" supervision, then in validation we can decode
+# and optionally run SAM for segmentation metrics.
 
 import argparse
 import yaml
@@ -18,46 +17,30 @@ from models.model import SAM4MLLMModel
 from engine.trainer import Trainer
 from util.utils import set_seed
 
-
-###############################################################################
-# Example main script
-###############################################################################
 def main(args):
-    # -------------------------------------------------------------------------
-    # 1. Load Config
-    # -------------------------------------------------------------------------
+    # 1. Load config
     with open(args.config, "r") as f:
         config = yaml.safe_load(f)
 
-    # fix seed
+    # 2. Fix seed
     set_seed(config.get("seed", 42))
 
-    # Retrieve from config
+    # 3. Retrieve model paths
     sam_model_path = config["model"]["sam"]
     qwen_model_path = config["model"]["qwen"]
     print(f"[DEBUG] SAM model path: {sam_model_path}")
     print(f"[DEBUG] Qwen model path: {qwen_model_path}")
 
-    # -------------------------------------------------------------------------
-    # 2. Decide how to load data
-    # -------------------------------------------------------------------------
-    # If the user sets `use_data: "woundsegmentation"`, we let the dataset
-    # load from CSV automatically by passing None for data_list.
-    # If the user sets `use_data: "dummy"`, we show a small example list.
-    #
-    # This ensures we do NOT hit the FileNotFoundError from "dummy1.png"
-    # unless you intentionally choose "dummy".
-    #
-    if config["dataset"]["use_data"] == "woundsegmentation":
+    # 4. Decide how to load data
+    use_data_mode = config["dataset"]["use_data"]
+    if use_data_mode == "woundsegmentation":
         train_data_list = None
         val_data_list = None
         print("[INFO] Using the woundsegmentation CSV data from root_dir.")
     else:
-        # fallback dummy
+        # fallback dummy data
         print("[INFO] Using dummy data_list since use_data != woundsegmentation.")
         train_data_list = [
-            # Example placeholders. In real usage, you might rely on `use_data`
-            # to auto-load from disk with segmentation maps, etc.
             {"image_path": "dummy1.png", "mask_path": "dummy1_mask.png", "conversation": "Segment the object."},
             {"image_path": "dummy2.png", "mask_path": "dummy2_mask.png", "conversation": "Segment the big region."}
         ]
@@ -65,36 +48,31 @@ def main(args):
             {"image_path": "dummy3.png", "mask_path": "dummy3_mask.png", "conversation": "Find me the object."}
         ]
 
-    # -------------------------------------------------------------------------
-    # 3. Prepare Dataset / Dataloader
-    # -------------------------------------------------------------------------
+    # 5. Prepare Dataset / DataLoader
     train_dataset = BaseSAM4MLLMDataset(
-        data_list=train_data_list,   # can be None if we want CSV-based loading
-        tokenizer=None,             # The actual Qwen tokenizer is loaded inside the backbone
+        data_list=train_data_list,
+        tokenizer=None,     # We do not use HF tokenizer here, we'll let SFT handle text
         transforms=None,
         max_len=config["train"]["max_len"],
         img_size=tuple(config["train"]["img_size"]),
         img_dir=config["train"]["img_dir"],
         system_prompt="You are a helpful segmentation assistant.",
-        use_data=config["dataset"]["use_data"],
+        use_data=use_data_mode,
         root_dir=config["dataset"]["root_dir"],
         split=config["dataset"]["split"]
     )
 
-    # For validation dataset, we typically do "split='test'" if there's a separate CSV/test set.
-    # But we rely on config["dataset"]["split"] = "train" or "test" as you prefer.
-    # For demonstration, we keep it the same. You might point it to a test CSV if you have one.
     val_dataset = BaseSAM4MLLMDataset(
-        data_list=val_data_list,     # can be None if we want CSV-based loading for val
+        data_list=val_data_list,
         tokenizer=None,
         transforms=None,
         max_len=config["train"]["max_len"],
         img_size=tuple(config["train"]["img_size"]),
         img_dir=config["train"]["img_dir"],
         system_prompt="You are a helpful segmentation assistant.",
-        use_data=config["dataset"]["use_data"],
+        use_data=use_data_mode,
         root_dir=config["dataset"]["root_dir"],
-        split=config["dataset"]["split"]  # or "test" if you want separate test set
+        split=config["dataset"]["split"]
     )
 
     train_loader = DataLoader(
@@ -103,7 +81,6 @@ def main(args):
         shuffle=True,
         num_workers=0
     )
-
     val_loader = DataLoader(
         val_dataset,
         batch_size=config["train"]["batch_size"],
@@ -111,22 +88,18 @@ def main(args):
         num_workers=0
     )
 
-    # -------------------------------------------------------------------------
-    # 4. Build Model
-    # -------------------------------------------------------------------------
+    # 6. Build the synergy backbone for Qwen + SAM
     from models.blocks.qwen_sam_backbone import QwenSamBackbone
-
-    # This backbone will internally load Qwen + SAM (but SAM is not trained).
     backbone = QwenSamBackbone(
         qwen_model_path=qwen_model_path,
         sam_model_path=sam_model_path,
-        device="cuda" if torch.cuda.is_available() else "cpu"
+        device="cuda" if torch.cuda.is_available() else "cpu",
+        override_patch_size=16,           # or 32 if you prefer
+        override_temporal_patch_size=1    # single-frame images
     )
     model = SAM4MLLMModel(backbone=backbone)
 
-    # -------------------------------------------------------------------------
-    # 5. Trainer
-    # -------------------------------------------------------------------------
+    # 7. Set up our trainer (which internally uses TRL’s SFT)
     trainer = Trainer(
         model=model,
         train_dataloader=train_loader,
@@ -145,11 +118,8 @@ def main(args):
         log_interval=config["train"]["log_interval"]
     )
 
-    # -------------------------------------------------------------------------
-    # 6. Train
-    # -------------------------------------------------------------------------
+    # 8. Train
     trainer.train()
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

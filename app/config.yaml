@@ -1,8 +1,9 @@
+# app/config.yaml
 seed: 42
 
 dataset:
   use_data: "woundsegmentation"  # or "dummy"
-  root_dir: "/home/dbcloud/桌面/wound_segmentation_classification_processed"
+  root_dir: "/root/autodl-tmp/dataset/wound_segmentation_classification_processed"
   split: "train"
 
 train:
@@ -15,15 +16,15 @@ train:
   early_stop_patience: 3
   clip_grad_norm: 1.0
   output_dir: "runs"
-  run_name: "sam4mllm_demo"
+  run_name: "sam4mllm"
   use_amp: true
   log_interval: 2
 
 optimizer:
-  lr: 1e-4
+  lr: 0.0001
   scheduler_type: "linear"  # or "cosine"
   warmup_steps: 1000
 
 model:
-  sam: "/home/dbcloud/PycharmProjects/mllm4sam/sam-vit-base"          # Path or HF repo for your SAM checkpoint if needed
-  qwen: "/home/dbcloud/PycharmProjects/mllm4sam/Qwen2-VL-2B-Instruct"    # Path or HF repo for Qwen model
+  sam: "/root/autodl-tmp/hfweights/sam-vit-base"        # Path or HF repo for your SAM checkpoint if needed
+  qwen: "/root/autodl-tmp/hfweights/qwen2vl2b"  # Path or HF repo for Qwen2-VL model

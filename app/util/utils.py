@@ -1,7 +1,4 @@
-# /home/dbcloud/PycharmProjects/mllm4sam/app/util/utils.py
-# Copyright (c) 2024, NVIDIA CORPORATION.
-# All rights reserved.
-
+# app/util/utils.py
 import os
 import random
 import numpy as np
