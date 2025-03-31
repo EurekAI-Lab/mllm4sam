@@ -1,0 +1,1296 @@
+# /home/dbcloud/PycharmProjects/mllm4sam/app/main.py
+# /home/dbcloud/PycharmProjects/mllm4sam/app/main.py
+# Copyright (c) 2024, NVIDIA CORPORATION.
+# All rights reserved.
+#
+# NVIDIA CORPORATION and its licensors retain all intellectual property
+# and proprietary rights in and to this software, related documentation
+# and any modifications thereto. Any use, reproduction, disclosure or
+# distribution of this software and related documentation without an express
+# license agreement from NVIDIA CORPORATION is strictly prohibited.
+
+import argparse
+import yaml
+import torch
+from torch.utils.data import DataLoader
+
+from dataloader.dataset_sam4mllm import BaseSAM4MLLMDataset
+from models.model import SAM4MLLMModel
+from engine.trainer import Trainer
+from util.utils import set_seed
+
+
+###############################################################################
+# Example main script
+###############################################################################
+def main(args):
+    # -------------------------------------------------------------------------
+    # 1. Load Config
+    # -------------------------------------------------------------------------
+    with open(args.config, "r") as f:
+        config = yaml.safe_load(f)
+
+    # fix seed
+    set_seed(config.get("seed", 42))
+
+    # Retrieve from config
+    sam_model_path = config["model"]["sam"]
+    qwen_model_path = config["model"]["qwen"]
+    print(f"[DEBUG] SAM model path: {sam_model_path}")
+    print(f"[DEBUG] Qwen model path: {qwen_model_path}")
+
+    # -------------------------------------------------------------------------
+    # 2. Decide how to load data
+    # -------------------------------------------------------------------------
+    # If the user sets `use_data: "woundsegmentation"`, we let the dataset
+    # load from CSV automatically by passing None for data_list.
+    # If the user sets `use_data: "dummy"`, we show a small example list.
+    #
+    # This ensures we do NOT hit the FileNotFoundError from "dummy1.png"
+    # unless you intentionally choose "dummy".
+    #
+    if config["dataset"]["use_data"] == "woundsegmentation":
+        train_data_list = None
+        val_data_list = None
+        print("[INFO] Using the woundsegmentation CSV data from root_dir.")
+    else:
+        # fallback dummy
+        print("[INFO] Using dummy data_list since use_data != woundsegmentation.")
+        train_data_list = [
+            # Example placeholders. In real usage, you might rely on `use_data`
+            # to auto-load from disk with segmentation maps, etc.
+            {"image_path": "dummy1.png", "mask_path": "dummy1_mask.png", "conversation": "Segment the object."},
+            {"image_path": "dummy2.png", "mask_path": "dummy2_mask.png", "conversation": "Segment the big region."}
+        ]
+        val_data_list = [
+            {"image_path": "dummy3.png", "mask_path": "dummy3_mask.png", "conversation": "Find me the object."}
+        ]
+
+    # -------------------------------------------------------------------------
+    # 3. Prepare Dataset / Dataloader
+    # -------------------------------------------------------------------------
+    train_dataset = BaseSAM4MLLMDataset(
+        data_list=train_data_list,   # can be None if we want CSV-based loading
+        tokenizer=None,             # The actual Qwen tokenizer is loaded inside the backbone
+        transforms=None,
+        max_len=config["train"]["max_len"],
+        img_size=tuple(config["train"]["img_size"]),
+        img_dir=config["train"]["img_dir"],
+        system_prompt="You are a helpful segmentation assistant.",
+        use_data=config["dataset"]["use_data"],
+        root_dir=config["dataset"]["root_dir"],
+        split=config["dataset"]["split"]
+    )
+
+    # For validation dataset, we typically do "split='test'" if there's a separate CSV/test set.
+    # But we rely on config["dataset"]["split"] = "train" or "test" as you prefer.
+    # For demonstration, we keep it the same. You might point it to a test CSV if you have one.
+    val_dataset = BaseSAM4MLLMDataset(
+        data_list=val_data_list,     # can be None if we want CSV-based loading for val
+        tokenizer=None,
+        transforms=None,
+        max_len=config["train"]["max_len"],
+        img_size=tuple(config["train"]["img_size"]),
+        img_dir=config["train"]["img_dir"],
+        system_prompt="You are a helpful segmentation assistant.",
+        use_data=config["dataset"]["use_data"],
+        root_dir=config["dataset"]["root_dir"],
+        split=config["dataset"]["split"]  # or "test" if you want separate test set
+    )
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config["train"]["batch_size"],
+        shuffle=True,
+        num_workers=0
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=config["train"]["batch_size"],
+        shuffle=False,
+        num_workers=0
+    )
+
+    # -------------------------------------------------------------------------
+    # 4. Build Model
+    # -------------------------------------------------------------------------
+    from models.blocks.qwen_sam_backbone import QwenSamBackbone
+
+    # This backbone will internally load Qwen + SAM (but SAM is not trained).
+    backbone = QwenSamBackbone(
+        qwen_model_path=qwen_model_path,
+        sam_model_path=sam_model_path,
+        device="cuda" if torch.cuda.is_available() else "cpu"
+    )
+    model = SAM4MLLMModel(backbone=backbone)
+
+    # -------------------------------------------------------------------------
+    # 5. Trainer
+    # -------------------------------------------------------------------------
+    trainer = Trainer(
+        model=model,
+        train_dataloader=train_loader,
+        val_dataloader=val_loader,
+        lr=config["optimizer"]["lr"],
+        max_epochs=config["train"]["epochs"],
+        grad_acc_steps=config["train"]["grad_acc_steps"],
+        scheduler_type=config["optimizer"]["scheduler_type"],
+        warmup_steps=config["optimizer"]["warmup_steps"],
+        early_stop_patience=config["train"]["early_stop_patience"],
+        clip_grad_norm=config["train"]["clip_grad_norm"],
+        output_dir=config["train"]["output_dir"],
+        run_name=config["train"]["run_name"],
+        device="cuda" if torch.cuda.is_available() else "cpu",
+        use_amp=config["train"]["use_amp"],
+        log_interval=config["train"]["log_interval"]
+    )
+
+    # -------------------------------------------------------------------------
+    # 6. Train
+    # -------------------------------------------------------------------------
+    trainer.train()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=str, default="config.yaml", help="Path to config")
+    args = parser.parse_args()
+    main(args)
+
+
+###################################################################
+
+# /home/dbcloud/PycharmProjects/mllm4sam/app/config.yaml
+seed: 42
+
+dataset:
+  use_data: "woundsegmentation"  # or "dummy"
+  root_dir: "/home/dbcloud/桌面/wound_segmentation_classification_processed"
+  split: "train"
+
+train:
+  max_len: 1536
+  img_size: [512, 512]
+  img_dir: "./data_images"
+  batch_size: 2
+  epochs: 3
+  grad_acc_steps: 1
+  early_stop_patience: 3
+  clip_grad_norm: 1.0
+  output_dir: "runs"
+  run_name: "sam4mllm_demo"
+  use_amp: true
+  log_interval: 2
+
+optimizer:
+  lr: 1e-4
+  scheduler_type: "linear"  # or "cosine"
+  warmup_steps: 1000
+
+model:
+  sam: "/home/dbcloud/PycharmProjects/mllm4sam/sam-vit-base"          # Path or HF repo for your SAM checkpoint if needed
+  qwen: "/home/dbcloud/PycharmProjects/mllm4sam/Qwen2-VL-2B-Instruct"    # Path or HF repo for Qwen model
+
+
+###################################################################
+
+# /home/dbcloud/PycharmProjects/mllm4sam/app/models/model.py
+# /home/dbcloud/PycharmProjects/mllm4sam/app/models/model.py
+# Copyright (c) 2024, NVIDIA CORPORATION.
+# All rights reserved.
+
+import torch
+import torch.nn as nn
+
+###############################################################################
+# SAM4MLLM Model
+###############################################################################
+class SAM4MLLMModel(nn.Module):
+    """
+    This wrapper now holds a QwenSamBackbone, which uses Qwen-VL and optionally
+    SAM synergy. We do NOT train SAM, only Qwen (with LoRA).
+    """
+
+    def __init__(self, backbone, projector=None):
+        super().__init__()
+        self.backbone = backbone
+        self.projector = projector  # e.g. if you want extra layers
+
+    def forward(self, input_ids, attention_mask, images=None, **kwargs):
+        outputs = self.backbone(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            images=images,
+            **kwargs
+        )
+        return outputs
+
+    def generate(self, input_ids, attention_mask, images=None, max_new_tokens=128, **kwargs):
+        if hasattr(self.backbone, "generate"):
+            return self.backbone.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                images=images,
+                max_new_tokens=max_new_tokens,
+                **kwargs
+            )
+        else:
+            print(f'[INFO] Model does not support generation.')
+            return None
+
+
+###################################################################
+
+# /home/dbcloud/PycharmProjects/mllm4sam/app/models/blocks/visual_encoder.py
+# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+#
+# NVIDIA CORPORATION and its licensors retain all intellectual property
+# and proprietary rights in and to this software, related documentation
+# and any modifications thereto. Any use, reproduction, disclosure or
+# distribution of this software and related documentation without an express
+# license agreement from NVIDIA CORPORATION is strictly prohibited.
+
+import torch
+import torch.nn as nn
+
+class VisualEncoder(nn.Module):
+    """
+    A placeholder for a custom visual encoder that might process images
+    before feeding into your main backbone. For instance,
+    you can incorporate SAM ViT or any other custom logic here.
+    """
+    def __init__(self, embed_dim=768):
+        super().__init__()
+        # In practice, you might load a pretrained SAM encoder or similar
+        self.conv = nn.Conv2d(3, embed_dim, kernel_size=7, stride=2, padding=3)
+
+    def forward(self, x: torch.Tensor):
+        """
+        x shape: (B, 3, H, W)
+        """
+        # Dummy forward
+        feats = self.conv(x)
+        return feats
+
+
+###################################################################
+
+# /home/dbcloud/PycharmProjects/mllm4sam/app/models/blocks/qwen_sam_backbone.py
+# /home/dbcloud/PycharmProjects/mllm4sam/app/models/blocks/qwen_sam_backbone.py
+# Copyright (c) 2024, NVIDIA CORPORATION.
+# All rights reserved.
+#
+# NVIDIA CORPORATION and its licensors retain all intellectual property
+# and proprietary rights in and to this software, related documentation
+# and any modifications thereto. Any use, reproduction, disclosure or
+# distribution of this software and related documentation without an express
+# license agreement from NVIDIA CORPORATION is strictly prohibited.
+#
+# -------------------------------------------------------------------------
+# This code provides a synergy backbone that integrates Qwen2-VL and (optionally)
+# a SAM model from Hugging Face Transformers. It gracefully handles the situation
+# where importing Qwen2VLConfig or Qwen2VLVisionConfig fails, by performing a
+# "monkey patch" of the Qwen2-VL visual patch embedding to avoid shape mismatch.
+#
+# Important notes:
+#  1) By default, Qwen2-VL expects patch_size=14, temporal_patch_size=2 for 224x224
+#     or 448x448, etc. If your data is 512x512 single-frame images, that leads to
+#     an invalid shape `'[-1,3,2,14,14]'`.
+#  2) If we cannot import Qwen2VLVisionConfig (the environment lacks it, or a version
+#     mismatch), we will forcibly do a "monkey patch" where we override the patch
+#     size and stride in Qwen2-VL's `PatchEmbed` module. This ensures shape alignment
+#     for e.g. 512x512 single-frame images.
+#  3) For 512x512, you can pick override_patch_size=16 (then 512/16=32).
+#     override_temporal_patch_size=1 if you do not have a time dimension.
+#  4) Full debugging prints are present, so you can confirm patch shapes.
+#  5) LoRA is attempted if environment is OK with `peft`; if it fails, it will
+#     log a warning and proceed.
+#
+# Example usage in your main code:
+#   from models.blocks.qwen_sam_backbone import QwenSamBackbone
+#   backbone = QwenSamBackbone(
+#       qwen_model_path="path_or_repo_to_Qwen2-VL",
+#       sam_model_path="path_or_repo_to_SAM",
+#       device="cuda",
+#       override_patch_size=16,
+#       override_temporal_patch_size=1
+#   )
+#   ...
+#
+# -------------------------------------------------------------------------
+
+import os
+import sys
+import torch
+import torch.nn as nn
+
+from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
+
+# Attempt to import SamModel, SamProcessor from HF:
+try:
+    from transformers import SamModel, SamProcessor
+    HF_SAM_AVAILABLE = True
+except ImportError as e:
+    print("[WARNING] Could not import SamModel, SamProcessor from transformers. Reason:", e)
+    HF_SAM_AVAILABLE = False
+
+# Attempt to import PEFT for LoRA:
+try:
+    from peft import LoraConfig, get_peft_model
+    LOADING_PEFT_OK = True
+except Exception as e:
+    print("[WARNING] Could not import peft or bitsandbytes. Reason:", e)
+    LOADING_PEFT_OK = False
+
+# Attempt to import Qwen2VLConfig, Qwen2VLVisionConfig (some envs lack it):
+try:
+    from transformers.models.qwen2_vl import Qwen2VLConfig, Qwen2VLVisionConfig
+    QWEN_CONFIG_AVAILABLE = True
+except ImportError as e:
+    print("[WARNING] Could not import Qwen2VLConfig or Qwen2VLVisionConfig. Reason:", e)
+    QWEN_CONFIG_AVAILABLE = False
+
+
+class QwenSamBackbone(nn.Module):
+    """
+    A synergy backbone that loads Qwen2-VL with Qwen2VLForConditionalGeneration
+    and optionally Hugging Face SAM.
+
+    Key features:
+      - If we cannot override the patch size via the config (import error),
+        we do a "monkey patch" on the model's `patch_embed` module to forcibly
+        set patch_size, temporal_patch_size, and the Conv3d kernel/stride.
+      - We do extensive debug prints to help identify shape mismatch issues.
+      - If environment does not allow LoRA (missing dev libraries, etc.), we skip it.
+
+    Args:
+        qwen_model_path (str): Path or repo ID for Qwen2-VL model.
+        sam_model_path (str): Path or repo ID for SAM model (optional).
+        device (str): "cuda" or "cpu".
+        override_patch_size (int): Desired patch_size for Qwen2-VL.
+                                   If images are 512x512, pick e.g. 16 or 32.
+        override_temporal_patch_size (int): Usually 1 for single images.
+    """
+
+    def __init__(
+        self,
+        qwen_model_path: str,
+        sam_model_path: str,
+        device="cuda",
+        override_patch_size: int = 16,
+        override_temporal_patch_size: int = 1,
+    ):
+        super().__init__()
+        self.device = device
+        self.override_patch_size = override_patch_size
+        self.override_temporal_patch_size = override_temporal_patch_size
+
+        # 1) Try to load Qwen2-VL with a custom config if possible:
+        if QWEN_CONFIG_AVAILABLE:
+            print("[INFO] Creating a custom Qwen2VLConfig to override patch sizes.")
+            try:
+                base_config = Qwen2VLConfig.from_pretrained(qwen_model_path, trust_remote_code=True)
+                vision_conf = base_config.vision_config
+                if not isinstance(vision_conf, Qwen2VLVisionConfig):
+                    print("[WARNING] vision_config not a Qwen2VLVisionConfig. We'll attempt to forcibly re-instantiate.")
+                    vision_conf = Qwen2VLVisionConfig()
+                print(f"[INFO] Overriding patch_size => {override_patch_size}, temporal_patch_size => {override_temporal_patch_size}")
+                vision_conf.patch_size = override_patch_size
+                vision_conf.temporal_patch_size = override_temporal_patch_size
+                base_config.vision_config = vision_conf
+
+                print(f"[DEBUG] Summarizing Qwen2VLVisionConfig:\n"
+                      f"  patch_size={base_config.vision_config.patch_size}, "
+                      f"  temporal_patch_size={base_config.vision_config.temporal_patch_size}")
+
+                print(f"[INFO] Loading Qwen2-VL model from {qwen_model_path} with custom config ...")
+                self.qwen_model = Qwen2VLForConditionalGeneration.from_pretrained(
+                    qwen_model_path,
+                    config=base_config,
+                    torch_dtype=torch.float16,
+                    trust_remote_code=True
+                ).to(device)
+            except Exception as e:
+                print(f"[WARNING] Something went wrong using custom config: {e}\n"
+                      f"Falling back to normal load and monkey patch.")
+                self.qwen_model = Qwen2VLForConditionalGeneration.from_pretrained(
+                    qwen_model_path,
+                    torch_dtype=torch.float16,
+                    trust_remote_code=True
+                ).to(device)
+                self._monkey_patch_patch_embed()
+        else:
+            # 2) If we can't import QWEN2VLVisionConfig, we do a normal load then monkey patch
+            print("[INFO] Loading Qwen2-VL model from the original config (cannot override patch sizes).")
+            self.qwen_model = Qwen2VLForConditionalGeneration.from_pretrained(
+                qwen_model_path,
+                torch_dtype=torch.float16,
+                trust_remote_code=True
+            ).to(device)
+            self._monkey_patch_patch_embed()
+
+        # Load the processor (tokenizer + image processor)
+        print("[INFO] Loading Qwen2-VL processor (tokenizer + image processor) ...")
+        self.qwen_processor = AutoProcessor.from_pretrained(qwen_model_path, trust_remote_code=True)
+        self.qwen_tokenizer = self.qwen_processor.tokenizer
+        if self.qwen_tokenizer.pad_token is None:
+            self.qwen_tokenizer.pad_token = self.qwen_tokenizer.eos_token
+
+        # Attempt LoRA
+        if LOADING_PEFT_OK:
+            try:
+                print("[INFO] Attempting to set up LoRA for Qwen2-VL ...")
+                self._setup_lora()
+            except Exception as e:
+                print("[WARNING] LoRA setup failed due to environment error. Disabling LoRA. Error:", e)
+        else:
+            print("[WARNING] LoRA is disabled because we cannot import PEFT properly.")
+
+        # Optionally load SAM
+        self.sam_model = None
+        self.sam_processor = None
+        if HF_SAM_AVAILABLE:
+            try:
+                print(f"[INFO] Attempting to load SAM model from {sam_model_path} via HF Transformers SamModel...")
+                self.sam_model = SamModel.from_pretrained(
+                    sam_model_path,
+                    torch_dtype=torch.float16
+                ).eval().to(device)
+                self.sam_processor = SamProcessor.from_pretrained(sam_model_path)
+            except Exception as e:
+                print(f"[WARNING] Could not load huggingface SamModel from {sam_model_path}. Reason: {e}")
+                self.sam_model = None
+                self.sam_processor = None
+        else:
+            print("[WARNING] SamModel is not available from transformers package. Skipping HF-SAM usage.")
+
+    def _monkey_patch_patch_embed(self):
+        """
+        If we can't override the Qwen2VL config or if it fails for some reason,
+        forcibly adjust Qwen2-VL's patch_embed to have the new patch_size
+        and temporal_patch_size. Then also fix the underlying conv's kernel/stride.
+        This ensures shape alignment for e.g. 512x512 input images.
+        """
+        # The Qwen2-VL code sets:
+        #    self.visual.patch_embed.patch_size
+        #    self.visual.patch_embed.temporal_patch_size
+        #    self.visual.patch_embed.proj = nn.Conv3d(in_channels=3, out_channels=embed_dim, kernel_size=..., stride=..., bias=False)
+        #
+        # We can attempt to do the same override now:
+        print("[INFO] Performing monkey patch for Qwen2-VL patch embedding to fix shape mismatch.")
+        patch_embed_module = getattr(self.qwen_model.visual, "patch_embed", None)
+        if patch_embed_module is None:
+            print("[WARNING] Could not locate patch_embed in self.qwen_model.visual. Skipping patch fix.")
+            return
+
+        # Patch in the new fields:
+        old_patch_size = patch_embed_module.patch_size
+        old_temporal = patch_embed_module.temporal_patch_size
+        embed_dim = patch_embed_module.embed_dim
+        in_channels = patch_embed_module.in_channels
+
+        print(f"[DEBUG] Original patch_embed.patch_size={old_patch_size}, patch_embed.temporal_patch_size={old_temporal}")
+        patch_embed_module.patch_size = self.override_patch_size
+        patch_embed_module.temporal_patch_size = self.override_temporal_patch_size
+
+        # Now reconstruct the conv layer with new kernel=[temporal, patch, patch], stride=same
+        kernel_size = [self.override_temporal_patch_size, self.override_patch_size, self.override_patch_size]
+        stride = [self.override_temporal_patch_size, self.override_patch_size, self.override_patch_size]
+        print(f"[DEBUG] Re-building patch_embed.proj with kernel_size={kernel_size}, stride={stride}, in_channels={in_channels}, out_channels={embed_dim}")
+        new_conv = nn.Conv3d(
+            in_channels,
+            embed_dim,
+            kernel_size=kernel_size,
+            stride=stride,
+            bias=False,
+        )
+        # Copy old weights if shapes match the new
+        if patch_embed_module.proj.weight.shape == new_conv.weight.shape:
+            with torch.no_grad():
+                new_conv.weight.copy_(patch_embed_module.proj.weight)
+            print("[INFO] Copied old patch_embed.proj weights to new shape (identical shape).")
+        else:
+            # If shape mismatch, we reset
+            nn.init.normal_(new_conv.weight, mean=0.0, std=0.02)
+            print("[WARNING] Old patch_embed.proj weights cannot be copied due to shape mismatch. Re-initialized randomly.")
+
+        patch_embed_module.proj = new_conv
+
+    def _setup_lora(self):
+        """
+        Create and apply a LoRA adapter config to Qwen2-VL if environment permits.
+        If it fails, we skip LoRA.
+        """
+        target_modules = [
+            "q_proj", "k_proj", "v_proj", "o_proj",
+            "gate_proj", "up_proj", "down_proj",
+        ]
+        lora_config = LoraConfig(
+            r=16,
+            lora_alpha=16,
+            target_modules=target_modules,
+            lora_dropout=0.05,
+            bias="none",
+            task_type="CAUSAL_LM"
+        )
+        self.qwen_model = get_peft_model(self.qwen_model, lora_config)
+        self.qwen_model.print_trainable_parameters()
+
+    def forward(self, input_ids, attention_mask, images=None, labels=None, **kwargs):
+        """
+        Standard forward pass for Qwen2VLForConditionalGeneration:
+          - If images is not None, we pass them as pixel_values (multi-modal).
+          - If labels is given, we get cross-entropy loss from Qwen2-VL.
+          - Print shapes for debug.
+        """
+        print(f"[DEBUG QwenSamBackbone] forward() input_ids shape: {input_ids.shape}")
+        print(f"[DEBUG QwenSamBackbone] forward() attention_mask shape: {attention_mask.shape}")
+        if images is not None:
+            print(f"[DEBUG QwenSamBackbone] forward() images shape: {images.shape}")
+
+        # The Qwen2-VL forward expects pixel_values=images
+        # The code will do an internal check to create the patch embeddings
+        # with patch size, etc. as we've forced or configured.
+        if images is not None:
+            outputs = self.qwen_model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                pixel_values=images,
+                labels=labels,
+                **kwargs
+            )
+        else:
+            outputs = self.qwen_model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                labels=labels,
+                **kwargs
+            )
+        return outputs
+
+    def generate(self, input_ids, attention_mask, images=None, max_new_tokens=128, **kwargs):
+        """
+        For text generation (multi-modal or text-only).
+        We do the same "pixel_values=images" approach if images are provided.
+        """
+        print(f"[DEBUG QwenSamBackbone] generate() input_ids shape: {input_ids.shape}")
+        print(f"[DEBUG QwenSamBackbone] generate() attention_mask shape: {attention_mask.shape}")
+        if images is not None:
+            print(f"[DEBUG QwenSamBackbone] generate() images shape: {images.shape}")
+
+        if images is not None:
+            outputs = self.qwen_model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                pixel_values=images,
+                max_new_tokens=max_new_tokens,
+                **kwargs
+            )
+        else:
+            outputs = self.qwen_model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=max_new_tokens,
+                **kwargs
+            )
+        return outputs
+
+
+###################################################################
+
+# /home/dbcloud/PycharmProjects/mllm4sam/app/engine/trainer.py
+# /home/dbcloud/PycharmProjects/mllm4sam/app/engine/trainer.py
+# Copyright (c) 2024, NVIDIA CORPORATION.
+# All rights reserved.
+
+import os
+import time
+import math
+import csv
+import wandb
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from tqdm import tqdm
+from datetime import datetime
+from torch.cuda.amp import autocast, GradScaler
+
+from util.logger import log_validation_samples
+from util.utils import set_seed, ensure_dir
+from engine.evaluator import Evaluator
+
+class Trainer:
+    def __init__(self,
+                 model,
+                 train_dataloader,
+                 val_dataloader=None,
+                 lr=1e-4,
+                 max_epochs=3,
+                 grad_acc_steps=1,
+                 scheduler_type="linear",
+                 warmup_steps=1000,
+                 early_stop_patience=5,
+                 clip_grad_norm=1.0,
+                 output_dir="runs",
+                 run_name="sam4mllm",
+                 device="cuda",
+                 use_amp=True,
+                 log_interval=10):
+        self.model = model
+        self.train_dataloader = train_dataloader
+        self.val_dataloader = val_dataloader
+
+        self.lr = lr
+        self.max_epochs = max_epochs
+        self.grad_acc_steps = grad_acc_steps
+        self.scheduler_type = scheduler_type
+        self.warmup_steps = warmup_steps
+        self.early_stop_patience = early_stop_patience
+        self.clip_grad_norm = clip_grad_norm
+
+        self.output_dir = output_dir
+        dt_string = datetime.now().strftime("%Y%m%d-%H%M%S")
+        self.run_dir = os.path.join(self.output_dir, f"{run_name}_{dt_string}")
+        ensure_dir(self.run_dir)
+
+        self.device = device
+        self.use_amp = use_amp
+        self.log_interval = log_interval
+
+        self.global_step = 0
+        self.best_val_loss = float("inf")
+        self.epochs_no_improve = 0
+        self.should_stop = False
+
+        # Move model to device
+        self.model.to(self.device)
+
+        # Setup wandb
+        wandb.init(project="SAM4MLLM", name=run_name, dir=self.run_dir)
+
+        # Setup logging files
+        self.train_log_path = os.path.join(self.run_dir, "train_log.csv")
+        self.val_log_path = os.path.join(self.run_dir, "val_log.csv")
+
+        with open(self.train_log_path, "w", newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(["step", "epoch", "loss", "lr"])
+        with open(self.val_log_path, "w", newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(["step", "epoch", "val_loss"])
+
+        # Setup optimizer
+        # Only LoRA parameters are "trainable" in the Qwen model
+        trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+        self.optimizer = optim.AdamW(trainable_params, lr=float(self.lr))
+
+        # Setup scheduler
+        num_training_steps = len(self.train_dataloader) // self.grad_acc_steps * self.max_epochs
+        self.lr_scheduler = self._create_scheduler(self.optimizer, num_training_steps)
+
+        # Setup grad scaler
+        self.scaler = GradScaler(enabled=self.use_amp)
+
+        # Evaluator
+        if self.val_dataloader is not None:
+            self.evaluator = Evaluator(self.model, self.device)
+        else:
+            self.evaluator = None
+
+        # Folder for saving sample predictions
+        self.val_samples_dir = os.path.join(self.run_dir, "val_samples")
+        ensure_dir(self.val_samples_dir)
+
+    def _create_scheduler(self, optimizer, num_training_steps):
+        if self.scheduler_type == "linear":
+            def lr_lambda(current_step: int):
+                if current_step < self.warmup_steps:
+                    return float(current_step) / float(max(1, self.warmup_steps))
+                return max(
+                    0.0, float(num_training_steps - current_step) / float(max(1, num_training_steps - self.warmup_steps))
+                )
+            scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+        elif self.scheduler_type == "cosine":
+            def lr_lambda(current_step: int):
+                if current_step < self.warmup_steps:
+                    return float(current_step) / float(max(1, self.warmup_steps))
+                progress = float(current_step - self.warmup_steps) / float(max(1, num_training_steps - self.warmup_steps))
+                return 0.5 * (1.0 + math.cos(math.pi * progress))
+            scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+        else:
+            raise ValueError(f"Unknown scheduler: {self.scheduler_type}")
+        return scheduler
+
+    def train(self):
+        for epoch in range(self.max_epochs):
+            print(f"\n=== [Epoch {epoch+1}/{self.max_epochs}] ===")
+            self.model.train()
+            epoch_loss = 0.0
+            step_count = 0
+
+            for step, batch in enumerate(tqdm(self.train_dataloader, desc="Training")):
+                # Move to device
+                input_ids = batch["input_ids"].to(self.device)
+                attention_mask = batch["attention_mask"].to(self.device)
+                images = batch.get("image", None)
+                if images is not None and isinstance(images, torch.Tensor):
+                    images = images.to(self.device)
+
+                loss_val = self._training_step(input_ids, attention_mask, images)
+                epoch_loss += loss_val
+                step_count += 1
+
+                if (step + 1) % self.log_interval == 0:
+                    avg_loss = epoch_loss / step_count
+                    lr_now = self.optimizer.param_groups[0]["lr"]
+                    print(f"Epoch [{epoch+1}] Step [{step+1}/{len(self.train_dataloader)}], "
+                          f"Loss: {avg_loss:.4f}, LR: {lr_now:.6f}")
+                    wandb.log({"train/loss": avg_loss, "train/lr": lr_now, "step": self.global_step})
+                    with open(self.train_log_path, "a", newline='') as f:
+                        writer = csv.writer(f)
+                        writer.writerow([self.global_step, epoch+1, avg_loss, lr_now])
+
+            # End of epoch
+            if self.val_dataloader is not None:
+                val_loss = self.validate(epoch+1)
+                if val_loss < self.best_val_loss:
+                    self.best_val_loss = val_loss
+                    self.epochs_no_improve = 0
+                    self._save_checkpoint(is_best=True, epoch=epoch+1)
+                else:
+                    self.epochs_no_improve += 1
+                    if self.epochs_no_improve >= self.early_stop_patience:
+                        print("Early stopping triggered!")
+                        self.should_stop = True
+                        break
+            else:
+                self._save_checkpoint(is_best=False, epoch=epoch+1)
+
+            if self.should_stop:
+                break
+
+        # Save final
+        self._save_checkpoint(is_best=False, epoch=self.max_epochs, last=True)
+
+    def _training_step(self, input_ids, attention_mask, images):
+        # We let the huggingface trainer do cross-entropy if we pass `labels`.
+        # So we'll pass `labels=input_ids` in a typical "teacher forcing" next token style
+        # but it requires we shift the tokens ourselves or rely on the built-in logic.
+        with autocast(enabled=self.use_amp):
+            # The HF CausalLM automatically uses next-token if we pass labels=input_ids
+            outputs = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                images=images,
+                labels=input_ids
+            )
+            loss = outputs.loss if hasattr(outputs, "loss") else outputs[0]
+
+        loss_for_backward = loss / self.grad_acc_steps
+        self.scaler.scale(loss_for_backward).backward()
+
+        if (self.global_step + 1) % self.grad_acc_steps == 0:
+            self.scaler.unscale_(self.optimizer)
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.clip_grad_norm)
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+            self.optimizer.zero_grad()
+            self.lr_scheduler.step()
+
+        self.global_step += 1
+        return loss.item()
+
+    def validate(self, epoch):
+        self.model.eval()
+        val_losses = []
+        # We'll store the samples for later logging
+        sample_storage = []
+        with torch.no_grad():
+            for i, batch in enumerate(tqdm(self.val_dataloader, desc=f"Validation Epoch {epoch}")):
+                input_ids = batch["input_ids"].to(self.device)
+                attention_mask = batch["attention_mask"].to(self.device)
+                images = batch.get("image", None)
+                if images is not None and isinstance(images, torch.Tensor):
+                    images = images.to(self.device)
+
+                with autocast(enabled=self.use_amp):
+                    outputs = self.model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        images=images,
+                        labels=input_ids
+                    )
+                    loss = outputs.loss if hasattr(outputs, "loss") else outputs[0]
+                    val_losses.append(loss.item())
+
+                # Store the first sample in this batch for logging
+                if i < 3:  # we log up to 3
+                    sample_storage.append({
+                        "input_ids": input_ids[0].detach().cpu(),
+                        "attention_mask": attention_mask[0].detach().cpu(),
+                        "points_str": batch.get("points_str", None)
+                    })
+
+        val_loss = sum(val_losses) / len(val_losses) if len(val_losses) > 0 else 0.0
+        with open(self.val_log_path, "a", newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([self.global_step, epoch, val_loss])
+
+        print(f"[Validation] Epoch: {epoch}, Loss: {val_loss:.4f}")
+        wandb.log({"val/loss": val_loss, "epoch": epoch, "step": self.global_step})
+
+        # Now log the 3 samples
+        log_validation_samples(
+            model=self.model,
+            val_samples=sample_storage,
+            device=self.device,
+            global_step=self.global_step,
+            out_dir=self.val_samples_dir,
+            tokenizer=getattr(self.model.backbone, "qwen_tokenizer", None)
+        )
+        return val_loss
+
+    def _save_checkpoint(self, is_best=False, epoch=0, last=False):
+        name = "best_model.pt" if is_best else "last_model.pt" if last else f"checkpoint_epoch_{epoch}.pt"
+        save_path = os.path.join(self.run_dir, name)
+        torch.save({
+            "epoch": epoch,
+            "global_step": self.global_step,
+            "model_state_dict": self.model.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "scheduler_state_dict": self.lr_scheduler.state_dict(),
+            "scaler_state_dict": self.scaler.state_dict()
+        }, save_path)
+        print(f"Checkpoint saved to {save_path}")
+
+
+###################################################################
+
+# /home/dbcloud/PycharmProjects/mllm4sam/app/engine/evaluator.py
+# /home/dbcloud/PycharmProjects/mllm4sam/app/engine/evaluator.py
+# Copyright (c) 2024, NVIDIA CORPORATION.
+# All rights reserved.
+
+import torch
+import torch.nn as nn
+
+class Evaluator:
+    """
+    Minimal evaluator skeleton for SAM4MLLM.
+    We do not do advanced metrics here. We let the trainer handle
+    the cross-entropy loss. This class can be expanded if needed.
+    """
+    def __init__(self, model: nn.Module, device="cuda"):
+        self.model = model
+        self.device = device
+
+    def evaluate(self, dataloader):
+        self.model.eval()
+        losses = []
+        with torch.no_grad():
+            for batch in dataloader:
+                input_ids = batch["input_ids"].to(self.device)
+                attention_mask = batch["attention_mask"].to(self.device)
+                images = batch.get("image", None)
+                if images is not None and isinstance(images, torch.Tensor):
+                    images = images.to(self.device)
+
+                outputs = self.model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    images=images,
+                    labels=input_ids
+                )
+                loss = outputs.loss if hasattr(outputs, "loss") else outputs[0]
+                losses.append(loss.item())
+
+        mean_loss = sum(losses) / len(losses) if len(losses) > 0 else 0
+        return {"loss": mean_loss}
+
+
+###################################################################
+
+# /home/dbcloud/PycharmProjects/mllm4sam/app/util/logger.py
+# /home/dbcloud/PycharmProjects/mllm4sam/app/util/logger.py
+# Copyright (c) 2024, NVIDIA CORPORATION.
+# All rights reserved.
+
+import wandb
+import torch
+
+def parse_points_from_text(text):
+    """
+    Attempt to parse lines like '(12,34), (56,78)' from the predicted text
+    Return a set of (x, y) tuples.
+    """
+    # naive parse
+    import re
+    pattern = r"\(\s*(\d+)\s*,\s*(\d+)\s*\)"
+    matches = re.findall(pattern, text)
+    points = set()
+    for match in matches:
+        x = int(match[0])
+        y = int(match[1])
+        points.add((x, y))
+    return points
+
+def compute_point_match(pred_set, gt_str):
+    """
+    Count how many points in pred_set also appear in the ground truth.
+    The ground truth is a string like '(x1,y1), (x2,y2)...' or "NoValidPoints".
+    """
+    if not gt_str or gt_str == "NoValidPoints":
+        return 1.0 if (len(pred_set) == 0) else 0.0
+
+    gt_points = parse_points_from_text(gt_str)
+    if len(gt_points) == 0:
+        # No GT
+        if len(pred_set) == 0:
+            return 1.0
+        else:
+            return 0.0
+
+    # measure fraction of GT that was predicted
+    correct = len(pred_set.intersection(gt_points))
+    total = len(gt_points)
+    return float(correct) / float(total) if total > 0 else 0.0
+
+def log_validation_samples(model, val_samples, device, global_step, out_dir, tokenizer=None):
+    """
+    For each sample in val_samples, decode the model's predictions and compute
+    a naive "point match" with the ground truth string.
+    """
+    if not val_samples:
+        return
+
+    model.eval()
+    for idx, sample in enumerate(val_samples):
+        input_ids = sample["input_ids"].unsqueeze(0).to(device)
+        attention_mask = sample["attention_mask"].unsqueeze(0).to(device)
+        gt_str = sample.get("points_str", None)
+        if gt_str is not None and isinstance(gt_str, list):
+            gt_str = gt_str[0]  # if it was batched
+
+        with torch.no_grad():
+            gen_tokens = model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=50
+            )
+        if tokenizer is not None:
+            pred_text = tokenizer.decode(gen_tokens[0], skip_special_tokens=True)
+        else:
+            # fallback
+            pred_text = str(gen_tokens[0].tolist())
+
+        # parse points
+        pred_points = parse_points_from_text(pred_text)
+        match_score = compute_point_match(pred_points, gt_str)
+
+        # Log to wandb
+        log_dict = {
+            f"val_sample_{idx}/pred_text": pred_text,
+            f"val_sample_{idx}/ground_truth_points": gt_str,
+            f"val_sample_{idx}/match_score": match_score,
+            "global_step": global_step
+        }
+        wandb.log(log_dict)
+
+
+###################################################################
+
+# /home/dbcloud/PycharmProjects/mllm4sam/app/util/metrics.py
+# /home/dbcloud/PycharmProjects/mllm4sam/app/util/metrics.py
+# Copyright (c) 2024, NVIDIA CORPORATION.
+# All rights reserved.
+
+def compute_iou(pred_mask, gt_mask):
+    """
+    Example IoU computation placeholder.
+    pred_mask, gt_mask: (H, W) boolean or 0/1 arrays
+    """
+    intersection = (pred_mask & gt_mask).sum()
+    union = (pred_mask | gt_mask).sum()
+    if union == 0:
+        return 1.0
+    return float(intersection) / float(union)
+
+
+###################################################################
+
+# /home/dbcloud/PycharmProjects/mllm4sam/app/util/utils.py
+# /home/dbcloud/PycharmProjects/mllm4sam/app/util/utils.py
+# Copyright (c) 2024, NVIDIA CORPORATION.
+# All rights reserved.
+
+import os
+import random
+import numpy as np
+import torch
+
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+def ensure_dir(path):
+    if not os.path.exists(path):
+        os.makedirs(path)
+
+
+###################################################################
+
+# /home/dbcloud/PycharmProjects/mllm4sam/app/dataloader/dataset_sam4mllm.py
+import os
+import csv
+import random
+import torch
+import numpy as np
+import PIL
+from torch.utils.data import Dataset
+
+def mask_to_points(mask_array, max_points=10):
+    """
+    Convert a binary segmentation mask to a list of (x,y) pixel coordinates
+    lying inside the mask. Return up to max_points of them.
+    """
+    coords = np.argwhere(mask_array == 1)  # shape (N, 2)
+    if len(coords) == 0:
+        return []
+    coords_list = coords.tolist()
+    random.shuffle(coords_list)
+    coords_list = coords_list[:max_points]
+    return coords_list
+
+class BaseSAM4MLLMDataset(Dataset):
+    """
+    A base dataset for SAM4MLLM demonstration that also
+    extracts random points from the segmentation mask as "ground truth."
+    We will present these points in the "assistant" portion to do
+    next-token cross-entropy training on Qwen's text output.
+
+    This version addresses:
+     - Forcing the image to 224 x 224 to match Qwen2-VL shape expectations.
+     - Additional debug prints for shape mismatch issues.
+     - Optional CSV loading for 'woundsegmentation' scenario.
+     - Using system_prompt to unify conversation text.
+
+    If the user sets `use_data: "woundsegmentation"`, then we attempt to load
+    a CSV with image/mask pairs from root_dir. Otherwise, we fallback to a
+    user-provided data_list or a dummy example.
+    """
+
+    def __init__(self,
+                 data_list=None,
+                 tokenizer=None,
+                 transforms=None,
+                 max_len=1536,
+                 img_size=(224, 224),   # We now default to 224x224
+                 img_dir='./data_images/',
+                 system_prompt="You are a helpful segmentation assistant.",
+                 use_data="dummy",
+                 root_dir="",
+                 split="train"):
+        super().__init__()
+        self.tokenizer = tokenizer
+        self.transforms = transforms
+        self.max_len = max_len
+        # We force 224 x 224 by default for Qwen2-VL
+        self.img_size = img_size
+        self.img_dir = img_dir
+        self.system_prompt = system_prompt
+        self.use_data = use_data
+        self.root_dir = root_dir
+        self.split = split
+
+        # Load or set data_list
+        if data_list is not None:
+            self.data_list = data_list
+        else:
+            self.data_list = []
+            if self.use_data == "woundsegmentation":
+                self.data_list = self._load_woundsegmentation_data()
+            else:
+                # fallback dummy
+                self.data_list = [
+                    {"image_path": "dummy1.png", "mask_path": "dummy1_mask.png", "conversation": "Segment?"},
+                    {"image_path": "dummy2.png", "mask_path": "dummy2_mask.png", "conversation": "Segment?"}
+                ]
+
+        self._prune_missing_files()
+
+    def __len__(self):
+        return len(self.data_list)
+
+    def __getitem__(self, idx: int):
+        item = self.data_list[idx]
+        image_path = item.get("image_path", None)
+        mask_path = item.get("mask_path", None)
+        conversation = item.get("conversation", "")
+
+        if not image_path:
+            raise ValueError(f"No 'image_path' found for index {idx} in data_list.")
+
+        # 1. Load image
+        full_image_path = self._resolve_path(image_path, subfolder="images")
+        if not os.path.exists(full_image_path):
+            raise FileNotFoundError(f"Image file not found even after pruning: {full_image_path}")
+        print(f"[DEBUG Dataset] Loading image: {full_image_path}")
+
+        image = PIL.Image.open(full_image_path).convert("RGB")
+
+        # 2. Load mask if mask_path is available
+        mask = None
+        if mask_path:
+            full_mask_path = self._resolve_path(mask_path, subfolder="masks")
+            if os.path.exists(full_mask_path):
+                print(f"[DEBUG Dataset] Loading mask: {full_mask_path}")
+                mask = PIL.Image.open(full_mask_path).convert("L")
+            else:
+                print(f"[DEBUG Dataset] No mask found at {full_mask_path}, skipping mask.")
+                mask = None
+
+        # 3. transforms or resizing to 224x224
+        #    Qwen2-VL’s patch-embedding requires (B, 3, 224, 224) by default
+        if self.transforms:
+            image = self.transforms(image)
+            if mask is not None:
+                mask = self.transforms(mask)
+        else:
+            image = image.resize(self.img_size)
+            if mask is not None:
+                mask = mask.resize(self.img_size)
+
+        # 4. Convert mask to up to 10 points
+        max_points = 10
+        points_str = ""
+        if mask is not None:
+            mask_np = np.array(mask, dtype=np.uint8)
+            mask_np = (mask_np >= 128).astype(np.uint8)
+            coords_list = mask_to_points(mask_np, max_points=max_points)
+            if len(coords_list) > 0:
+                points_str_list = []
+                for (y, x) in coords_list:
+                    points_str_list.append(f"({x},{y})")
+                points_str = ", ".join(points_str_list)
+            else:
+                points_str = "NoValidPoints"
+        else:
+            # If no mask, we have no valid points
+            points_str = "NoValidPoints"
+
+        # 5. Build textual prompt
+        user_text = f"Please provide up to 10 points that cover the object region."
+        assistant_text = points_str
+        full_text = (
+            f"{self.system_prompt}\n[USER]: {conversation}\n"
+            f"[USER]: {user_text}\n"
+            f"[ASSISTANT]: {assistant_text}"
+        )
+
+        # 6. Tokenize if available
+        if self.tokenizer is not None:
+            tokens = self.tokenizer(
+                full_text,
+                return_tensors="pt",
+                truncation=True,
+                max_length=self.max_len
+            )
+            input_ids = tokens["input_ids"].squeeze(0)
+            attention_mask = tokens["attention_mask"].squeeze(0)
+        else:
+            # placeholders
+            input_ids = torch.tensor([0])
+            attention_mask = torch.tensor([1])
+
+        # 7. Convert image to tensor if still PIL
+        if isinstance(image, PIL.Image.Image):
+            image = torch.from_numpy(np.array(image)).permute(2, 0, 1)
+        # Debug shape
+        print(f"[DEBUG Dataset] Final image shape: {image.shape}")
+
+        sample = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "image": image,
+            "points_str": points_str
+        }
+        return sample
+
+    def _resolve_path(self, filename, subfolder="images"):
+        """
+        1) Fix common issues if 'train/images/' or 'test/images/' are already in 'filename'
+           so we don't double them.
+        2) Attempt to see if it's an absolute path. If so, return it.
+        3) Otherwise, check if it's in self.img_dir
+        4) Else, fallback to root_dir/split/subfolder/filename
+        """
+        fix_list = [
+            "train/images/", "test/images/",
+            "train/masks/", "test/masks/"
+        ]
+        for fix_token in fix_list:
+            if fix_token in filename:
+                # print(f"[DEBUG Dataset] Stripping '{fix_token}' from filename: {filename}")
+                filename = filename.replace(fix_token, "")
+
+        # Now proceed
+        if os.path.isabs(filename):
+            return filename
+
+        potential_path = os.path.join(self.img_dir, filename)
+        if os.path.exists(potential_path):
+            return potential_path
+
+        alt = os.path.join(self.root_dir, self.split, subfolder, filename)
+        return alt
+
+    def _load_woundsegmentation_data(self):
+        """
+        If `use_data == "woundsegmentation"`, we read from:
+          root_dir/train_labels.csv or root_dir/test_labels.csv
+        to build data_list with image_path, mask_path, conversation, etc.
+        """
+        data_list = []
+        csv_name = "train_labels.csv" if self.split == "train" else "test_labels.csv"
+        csv_path = os.path.join(self.root_dir, csv_name)
+        if not os.path.exists(csv_path):
+            print(f"[WARNING] CSV file not found at {csv_path}. Returning empty data_list.")
+            return data_list
+
+        with open(csv_path, "r", encoding="utf-8") as f:
+            reader = csv.reader(f)
+            for row in reader:
+                if not row:
+                    continue
+                filename = row[0].strip()
+                data_item = {
+                    "image_path": filename,
+                    "mask_path": filename,
+                    "conversation": "Help me segment this wound."
+                }
+                data_list.append(data_item)
+        return data_list
+
+    def _prune_missing_files(self):
+        kept = []
+        for item in self.data_list:
+            resolved = self._resolve_path(item["image_path"], subfolder="images")
+            if not os.path.exists(resolved):
+                print(f"[WARNING] Skipping nonexistent file: {resolved}")
+                continue
+            kept.append(item)
+        self.data_list = kept
+        print(f"[INFO] After pruning, we have {len(self.data_list)} valid samples.")
+
+
+###################################################################
+
+<Code requirement>
+Help me with this problem. If you change my code, you should give me full class of that part,
+You should never ignore, simplify, or skip code, NEVER ignore my demand.
+Your code should be always complete and runnable. Eligible for top conference, such as MICCAI, etc. Highly maintanable and innovative.
+For hard shape mismatching problem, you can always print out for help you debug.
+Never return me a snippet of code.
