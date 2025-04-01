@@ -1,31 +1,3 @@
-# /home/dbcloud/PycharmProjects/mllm4sam/app/models/blocks/qwen_sam_backbone.py
-# Copyright (c) 2024, NVIDIA CORPORATION.
-# All rights reserved.
-#
-# NVIDIA CORPORATION and its licensors retain all intellectual property
-# and proprietary rights in and to this software, related documentation
-# and any modifications thereto.  Any use, reproduction, disclosure or
-# distribution of this software and related documentation without an express
-# license agreement from NVIDIA CORPORATION is strictly prohibited.
-#
-# -------------------------------------------------------------------------
-# This code provides a synergy backbone that integrates Qwen2-VL and (optionally)
-# a SAM model from Hugging Face Transformers. It attempts to fix shape mismatch issues
-# by dynamically overriding Qwen2-VL's default patch embedding layer. It also calculates
-# and provides the proper 'image_grid_thw' argument to Qwen2-VL for single-frame images.
-#
-# Key changes made to avoid the "NoneType object is not iterable" error:
-#   1) We now compute 'image_grid_thw' in `_calculate_grid_thw(images)` if 'images' is not None.
-#   2) We pass 'image_grid_thw' to the Qwen2VLForConditionalGeneration call.
-#   3) We print out debug statements for shape mismatch resolution.
-#
-# This class is complete and runnable. We do not change the class name or any existing function names.
-# We add default arguments where needed. We do not remove or skip any code, ensuring high maintainability
-# and thorough debug printing for shape mismatch problems. The code is suitable for top-tier conferences
-# (CVPR/AAAI) as requested, with an innovative approach to synergy between Qwen-VL and SAM.
-#
-# -------------------------------------------------------------------------
-
 import os
 import sys
 import torch
@@ -36,6 +8,7 @@ from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
 # Attempt to import SamModel, SamProcessor for optional synergy
 try:
     from transformers import SamModel, SamProcessor
+
     HF_SAM_AVAILABLE = True
 except ImportError as e:
     print("[WARNING] Could not import SamModel or SamProcessor from transformers. Reason:", e)
@@ -44,6 +17,7 @@ except ImportError as e:
 # Attempt to import PEFT for LoRA
 try:
     from peft import LoraConfig, get_peft_model
+
     LOADING_PEFT_OK = True
 except ImportError as e:
     print("[WARNING] Could not import peft or bitsandbytes. Reason:", e)
@@ -52,6 +26,7 @@ except ImportError as e:
 # Attempt to import Qwen2-VL PatchEmbed
 try:
     from transformers.models.qwen2_vl.modeling_qwen2_vl import PatchEmbed
+
     QWEN_CONFIG_AVAILABLE = True
 except ImportError as e:
     print("[WARNING] Could not import Qwen2VL PatchEmbed. Reason:", e)
@@ -74,12 +49,12 @@ class QwenSamBackbone(nn.Module):
     """
 
     def __init__(
-        self,
-        qwen_model_path: str,
-        sam_model_path: str,
-        device: str = "cuda",
-        override_patch_size: int = 16,
-        override_temporal_patch_size: int = 1,
+            self,
+            qwen_model_path: str,
+            sam_model_path: str,
+            device: str = "cuda",
+            override_patch_size: int = 16,
+            override_temporal_patch_size: int = 1,
     ):
         """
         Args:
@@ -250,12 +225,12 @@ class QwenSamBackbone(nn.Module):
         return grid_thw
 
     def forward(
-        self,
-        input_ids: torch.Tensor = None,
-        attention_mask: torch.Tensor = None,
-        images: torch.Tensor = None,
-        labels: torch.Tensor = None,
-        **kwargs,
+            self,
+            input_ids: torch.Tensor = None,
+            attention_mask: torch.Tensor = None,
+            images: torch.Tensor = None,
+            labels: torch.Tensor = None,
+            **kwargs,
     ):
         """
         Standard forward pass for Qwen2VLForConditionalGeneration. We add 'image_grid_thw'
@@ -270,44 +245,54 @@ class QwenSamBackbone(nn.Module):
         """
         # We possibly remove extra keys from kwargs that Qwen2-VL won't accept, but we keep them
         # in debug prints. We never skip or simplify; we just pop them if needed.
-        for k in list(kwargs.keys()):
+
+        # Make a copy of kwargs to avoid modifying the original dict during iteration
+        kwargs_copy = kwargs.copy()
+
+        # Check if image_grid_thw is already in kwargs
+        use_provided_grid_thw = "image_grid_thw" in kwargs
+
+        for k in list(kwargs_copy.keys()):
             if k not in [
                 "pixel_values", "image_grid_thw", "cache_position", "use_cache",
                 "output_attentions", "output_hidden_states", "return_dict"
             ]:
                 ignored = kwargs.pop(k, None)
                 # if ignored is not None:
-                    # print(f"[DEBUG] Ignoring extra kwarg '{k}' passed to QwenSamBackbone.forward()")
+                #    print(f"[DEBUG] Ignoring extra kwarg '{k}' passed to QwenSamBackbone.forward()")
 
-        # If images is not None, compute 'image_grid_thw' dynamically
+        # If images is not None and image_grid_thw is not provided, compute it dynamically
         image_grid_thw = None
-        if images is not None:
+        if images is not None and not use_provided_grid_thw:
             # We'll compute the shape-based grid
             image_grid_thw = self._calculate_grid_thw(images)
+            # Print for debug
+            # print(f"[DEBUG] Calculated image_grid_thw: {image_grid_thw[0].tolist() if image_grid_thw is not None else None}")
 
-        # Debug shapes
+        # Debug shapes for help debugging
         # if input_ids is not None:
-            # print(f"[DEBUG QwenSamBackbone.forward()] input_ids shape: {input_ids.shape}")
+        #    print(f"[DEBUG QwenSamBackbone.forward()] input_ids shape: {input_ids.shape}")
         # if attention_mask is not None:
-            # print(f"[DEBUG QwenSamBackbone.forward()] attention_mask shape: {attention_mask.shape}")
+        #    print(f"[DEBUG QwenSamBackbone.forward()] attention_mask shape: {attention_mask.shape}")
         # if images is not None:
-            # print(f"[DEBUG QwenSamBackbone.forward()] images shape: {images.shape}")
+        #    print(f"[DEBUG QwenSamBackbone.forward()] images shape: {images.shape}")
 
-        # If images is not None, pass them as pixel_values plus 'image_grid_thw'
+        # Use either the provided image_grid_thw from kwargs or the one we calculated
+        model_kwargs = kwargs.copy()
         if images is not None:
-            # print(f'input_ids shape: {images.shape}')
-            # print(f'attention_mask shape: {attention_mask.shape}')
-            # print(f'images shape: {images.shape}')
-            # print(f'image_grid_thw shape: {image_grid_thw.shape}')
-            # print(f'labels shape: {labels.shape}')
+            if not use_provided_grid_thw and image_grid_thw is not None:
+                model_kwargs["image_grid_thw"] = image_grid_thw
+
+            # print(f"[DEBUG] Using pixel_values shape: {images.shape}")
+            # if "image_grid_thw" in model_kwargs:
+            #    print(f"[DEBUG] Using image_grid_thw shape: {model_kwargs['image_grid_thw'].shape}")
 
             outputs = self.qwen_model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 pixel_values=images,
-                image_grid_thw=image_grid_thw,  # Prevent NoneType
                 labels=labels,
-                **kwargs
+                **model_kwargs
             )
         else:
             # No images, text-only
@@ -321,46 +306,71 @@ class QwenSamBackbone(nn.Module):
         return outputs
 
     def generate(
-        self,
-        input_ids: torch.Tensor = None,
-        attention_mask: torch.Tensor = None,
-        images: torch.Tensor = None,
-        max_new_tokens: int = 128,
-        **kwargs,
+            self,
+            input_ids: torch.Tensor = None,
+            attention_mask: torch.Tensor = None,
+            images: torch.Tensor = None,
+            max_new_tokens: int = 128,
+            **kwargs,
     ):
         """
         For text generation (multi-modal or text-only). We also compute 'image_grid_thw'
         if images is present, to avoid NoneType errors in Qwen2-VL generation.
         """
+        # Make a copy of kwargs to avoid modifying the original dict during iteration
+        kwargs_copy = kwargs.copy()
 
-        for k in list(kwargs.keys()):
+        # Check if image_grid_thw is already in kwargs
+        use_provided_grid_thw = "image_grid_thw" in kwargs
+
+        for k in list(kwargs_copy.keys()):
             if k not in [
                 "pixel_values", "image_grid_thw", "cache_position", "use_cache",
                 "output_attentions", "output_hidden_states", "return_dict"
             ]:
                 ignored = kwargs.pop(k, None)
-                if ignored is not None:
-                    print(f"[DEBUG] Ignoring extra kwarg '{k}' passed to QwenSamBackbone.generate()")
+                # if ignored is not None:
+                #    print(f"[DEBUG] Ignoring extra kwarg '{k}' passed to QwenSamBackbone.generate()")
 
+        # Calculate image_grid_thw only if not already provided
         image_grid_thw = None
-        if images is not None:
+        if images is not None and not use_provided_grid_thw:
             image_grid_thw = self._calculate_grid_thw(images)
-            print(f"[DEBUG QwenSamBackbone.generate()] images shape: {images.shape}")
+            # print(f"[DEBUG QwenSamBackbone.generate()] images shape: {images.shape}")
 
-        if input_ids is not None:
-            print(f"[DEBUG QwenSamBackbone.generate()] input_ids shape: {input_ids.shape}")
-        if attention_mask is not None:
-            print(f"[DEBUG QwenSamBackbone.generate()] attention_mask shape: {attention_mask.shape}")
+        # if input_ids is not None:
+        #    print(f"[DEBUG QwenSamBackbone.generate()] input_ids shape: {input_ids.shape}")
+        # if attention_mask is not None:
+        #    print(f"[DEBUG QwenSamBackbone.generate()] attention_mask shape: {attention_mask.shape}")
 
+        # Use either the provided image_grid_thw from kwargs or the one we calculated
+        model_kwargs = kwargs.copy()
         if images is not None:
-            outputs = self.qwen_model.generate(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                pixel_values=images,
-                image_grid_thw=image_grid_thw,
-                max_new_tokens=max_new_tokens,
-                **kwargs
-            )
+            if not use_provided_grid_thw and image_grid_thw is not None:
+                model_kwargs["image_grid_thw"] = image_grid_thw
+
+            try:
+                outputs = self.qwen_model.generate(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    pixel_values=images,
+                    max_new_tokens=max_new_tokens,
+                    **model_kwargs
+                )
+            except Exception as e:
+                print(f"[WARNING] Error in generation with images: {e}")
+                print(f"[DEBUG] Generation shapes - input_ids: {input_ids.shape if input_ids is not None else None}, "
+                      f"attention_mask: {attention_mask.shape if attention_mask is not None else None}, "
+                      f"images: {images.shape if images is not None else None}, "
+                      f"image_grid_thw: {model_kwargs.get('image_grid_thw').shape if 'image_grid_thw' in model_kwargs else None}")
+                # Fallback to text-only generation
+                print("[INFO] Falling back to text-only generation")
+                outputs = self.qwen_model.generate(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    max_new_tokens=max_new_tokens,
+                    **{k: v for k, v in model_kwargs.items() if k != "image_grid_thw" and k != "pixel_values"}
+                )
         else:
             outputs = self.qwen_model.generate(
                 input_ids=input_ids,
@@ -424,32 +434,97 @@ class QwenSamBackbone(nn.Module):
         tokenized_prompt = self.qwen_tokenizer([prompt], return_tensors="pt").to(self.device)
 
         # Run text generation to get point coordinates
-        with torch.no_grad():
-            generated_ids = self.generate(
-                input_ids=tokenized_prompt.input_ids,
-                attention_mask=tokenized_prompt.attention_mask,
-                images=pixel_values,
-                max_new_tokens=128,
-                temperature=0.2,  # Lower temperature for more deterministic outputs
-                do_sample=False,  # Greedy decoding for coordinates
-                num_beams=1
-            )
+        try:
+            with torch.no_grad():
+                # Calculate image grid dimensions for this specific image
+                batch_size, channels, height, width = pixel_values.shape
+                patch_size = self.override_patch_size
+                h_grid = height // patch_size
+                w_grid = width // patch_size
 
-            # Decode the generated text
-            generated_text = self.qwen_tokenizer.decode(generated_ids[0], skip_special_tokens=True)
+                # Generate spatial_merge_size (default 2)
+                spatial_merge_size = 2
+                if hasattr(self.qwen_model.config, "vision_config"):
+                    vc = self.qwen_model.config.vision_config
+                    if hasattr(vc, "spatial_merge_size"):
+                        spatial_merge_size = vc.spatial_merge_size
 
-            # Extract the model's response (after the prompt)
-            response = generated_text.split(prompt)[-1].strip()
+                # Calculate expected number of image tokens
+                n_image_tokens = (h_grid * w_grid) // (spatial_merge_size * spatial_merge_size)
 
-            # Parse coordinates using improved parser
-            points = self._parse_coordinates_from_text(response)
+                # Create image_grid_thw tensor
+                image_grid_thw = torch.tensor(
+                    [[1, h_grid, w_grid]],  # Batch size of 1
+                    device=self.device,
+                    dtype=torch.long
+                )
 
-            # If no points were found, return empty result
-            if len(points) == 0:
-                print(f"[WARNING] No valid coordinates found in model output: {response}")
-                if return_points:
-                    return {"mask": None, "points": [], "confidence": 0.0}
-                return {"mask": None, "confidence": 0.0}
+                # Get vision token IDs
+                vision_start_token_id = self.qwen_model.config.vision_start_token_id
+                image_token_id = self.qwen_model.config.image_token_id
+
+                # Append vision tokens to the prompt
+                input_ids = tokenized_prompt.input_ids[0]
+                attention_mask = tokenized_prompt.attention_mask[0]
+
+                # Append vision tokens
+                input_ids_with_vision = torch.cat([
+                    input_ids,
+                    torch.tensor([vision_start_token_id], device=self.device),
+                    torch.tensor([image_token_id] * n_image_tokens, device=self.device)
+                ])
+
+                attention_mask_with_vision = torch.cat([
+                    attention_mask,
+                    torch.ones(1 + n_image_tokens, device=self.device, dtype=attention_mask.dtype)
+                ])
+
+                # Reshape for batch dimension
+                input_ids_with_vision = input_ids_with_vision.unsqueeze(0)
+                attention_mask_with_vision = attention_mask_with_vision.unsqueeze(0)
+
+                print(f"[DEBUG] Generation - input_ids: {input_ids_with_vision.shape}, "
+                      f"attention_mask: {attention_mask_with_vision.shape}, "
+                      f"images: {pixel_values.shape}, image_grid_thw: {image_grid_thw.shape}")
+
+                # Generate with explicit image tokens and grid
+                generated_ids = self.qwen_model.generate(
+                    input_ids=input_ids_with_vision,
+                    attention_mask=attention_mask_with_vision,
+                    pixel_values=pixel_values,
+                    image_grid_thw=image_grid_thw,
+                    max_new_tokens=128,
+                    temperature=0.2,  # Lower temperature for more deterministic outputs
+                    do_sample=False,  # Greedy decoding for coordinates
+                    num_beams=1
+                )
+
+                # Decode the generated text
+                generated_text = self.qwen_tokenizer.decode(generated_ids[0], skip_special_tokens=True)
+
+                # Extract the model's response (after the prompt)
+                if "[ASSISTANT]:" in generated_text:
+                    response = generated_text.split("[ASSISTANT]:")[-1].strip()
+                else:
+                    # Fallback - extract text after the prompt
+                    response = generated_text.split(prompt)[-1].strip()
+
+                # Parse coordinates using improved parser
+                points = self._parse_coordinates_from_text(response)
+
+                # If no points were found, return empty result
+                if len(points) == 0:
+                    print(f"[WARNING] No valid coordinates found in model output: {response}")
+                    if return_points:
+                        return {"mask": None, "points": [], "confidence": 0.0}
+                    return {"mask": None, "confidence": 0.0}
+
+                print(f"[INFO] Successfully found {len(points)} points")
+        except Exception as e:
+            print(f"[ERROR] Failed to generate or parse points: {e}")
+            if return_points:
+                return {"mask": None, "points": [], "confidence": 0.0}
+            return {"mask": None, "confidence": 0.0}
 
         # 2) Pass points to SAM for segmentation
         if self.sam_model is not None and self.sam_processor is not None:

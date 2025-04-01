@@ -12,10 +12,10 @@ import yaml
 import torch
 from torch.utils.data import DataLoader
 
-from dataloader.dataset_sam4mllm import BaseSAM4MLLMDataset
-from models.model import SAM4MLLMModel
-from engine.trainer import Trainer
-from util.utils import set_seed
+from app.dataloader.dataset_sam4mllm import BaseSAM4MLLMDataset
+from app.engine.trainer import Trainer
+from app.models.model import SAM4MLLMModel
+from app.util.utils import set_seed
 
 def main(args):
     # 1. Load config

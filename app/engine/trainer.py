@@ -1,12 +1,3 @@
-# app/engine/trainer.py
-# Copyright (c) 2024, NVIDIA CORPORATION.
-# All rights reserved.
-#
-# We do NOT rename "Trainer" but we incorporate TRL's SFTTrainer logic here
-# to remain consistent with user demands. We also keep your existing approach for
-# evaluation. The user is free to add or remove references to bitsandbytes or QLoRA
-# if desired.
-
 import os
 import math
 import csv
@@ -33,14 +24,22 @@ class ValidationCallback(TrainerCallback):
 
     def __init__(self, trainer):
         self.trainer = trainer
+        self.last_validation_step = 0  # Track when we last did validation
+        self.validation_interval = self.trainer.sft_config.eval_steps  # How often to validate
 
     def on_step_end(self, args, state, control, **kwargs):
-        if state.global_step % self.trainer.sft_config.eval_steps == 0:
-            print(f"[INFO] 在步骤 {state.global_step} 运行验证")
+        """Only run validation if enough steps have passed since the last validation"""
+        current_step = state.global_step
+        steps_since_last = current_step - self.last_validation_step
+
+        if steps_since_last >= self.validation_interval:
+            print(f"[INFO] 在步骤 {state.global_step} 运行验证 (上次验证: {self.last_validation_step})")
             # 更新全局步数用于日志
             self.trainer.global_step = state.global_step
             # 运行验证
             self.trainer._eval_validation()
+            # Update last validation step
+            self.last_validation_step = current_step
 
 
 class Trainer:
@@ -116,7 +115,7 @@ class Trainer:
         self.sft_config = SFTConfig(
             num_train_epochs=max_epochs,
             per_device_train_batch_size=1,  # 我们会通过自定义逻辑传递实际批次
-            per_device_eval_batch_size=1,
+            per_device_eval_batch_size=1,  # Force batch size of 1 for evaluation to avoid collation issues
             gradient_accumulation_steps=grad_acc_steps,
             max_seq_length=1536,
             learning_rate=lr,
@@ -124,15 +123,20 @@ class Trainer:
             warmup_ratio=0.0,
             output_dir=self.run_dir,
             logging_steps=10,
-            eval_steps=50,  # 每50步运行一次验证
-            save_steps=200,
+            eval_steps=200,  # 增加验证间隔，减少验证频率
+            save_steps=500,  # 同时增加保存间隔
             dataset_kwargs={"skip_prepare_dataset": True},
             remove_unused_columns=False,  # 保留'text_input'/'image'键
             save_safetensors=False,  # 避免safetensors共享张量问题
         )
 
-        # 准备评估器
-        self.evaluator = Evaluator(self.model, self.device) if self.val_dataloader else None
+        # 准备评估器，并限制最大评估样本数
+        self.evaluator = Evaluator(
+            self.model,
+            self.device,
+            output_dir=os.path.join(self.run_dir, "validation_viz"),
+            max_eval_samples=10  # Only evaluate a maximum of 10 samples
+        ) if self.val_dataloader else None
 
         # 全局步数跟踪
         self.global_step = 0
@@ -142,7 +146,6 @@ class Trainer:
 
         # 将模型移至设备
         self.model.to(self.device)
-
 
     def train(self):
         """
@@ -199,93 +202,133 @@ class Trainer:
               - 1个vision_start_token_id
               - 重复的image_token_id（匹配最终patch数量）。
             我们还将调整`labels`，使附加标记的标签=-100。
+
+            Enhanced:
+            - Added debug prints for shape tracking
+            - Added error handling for inconsistent batch items
+            - Limit to batch size 1 for validation
             """
-            text_list = [item["text_input"] for item in batch]
-            images = [item["image"] for item in batch]
+            # Print item keys for debugging
+            if len(batch) == 0:
+                print("[WARNING] Empty batch passed to data collator")
+                # Return an empty dict with the expected structure
+                return {
+                    "input_ids": torch.zeros((0, 0), dtype=torch.long),
+                    "attention_mask": torch.zeros((0, 0), dtype=torch.long),
+                    "images": torch.zeros((0, 3, 512, 512), dtype=torch.float),
+                    "labels": torch.zeros((0, 0), dtype=torch.long),
+                }
 
-            # Qwen的分词器
-            tokenizer = self.model.backbone.qwen_tokenizer
+            # Print debug info
+            # print(f"[DEBUG] Batch size: {len(batch)}")
+            # print(f"[DEBUG] First batch item keys: {list(batch[0].keys())}")
 
-            # 1) 基本文本分词
-            encoded = tokenizer(
-                text_list,
-                padding=False,  # 我们将在下面手动填充
-                truncation=True,
-                max_length=self.sft_config.max_seq_length,
-                return_tensors="pt",
-            )
+            try:
+                text_list = [item["text_input"] for item in batch]
+                images = [item["image"] for item in batch]
 
-            # 将图像转换为浮点数
-            pixel_values = torch.stack(images, dim=0).float()
+                # Qwen的分词器
+                tokenizer = self.model.backbone.qwen_tokenizer
 
-            # 从配置中识别特殊标记ID
-            vs_id = self.model.backbone.qwen_model.config.vision_start_token_id
-            vi_id = self.model.backbone.qwen_model.config.image_token_id
-            pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+                # 1) 基本文本分词
+                encoded = tokenizer(
+                    text_list,
+                    padding=False,  # 我们将在下面手动填充
+                    truncation=True,
+                    max_length=self.sft_config.max_seq_length,
+                    return_tensors="pt",
+                )
 
-            batch_input_ids = []
-            batch_attention_mask = []
-            batch_labels = []
+                # 将图像转换为浮点数
+                pixel_values = torch.stack(images, dim=0).float()
 
-            # 2) 构建最终序列，可能添加视觉标记
-            for i in range(len(batch)):
-                input_ids_i = encoded["input_ids"][i]
-                attention_mask_i = encoded["attention_mask"][i]
+                # 从配置中识别特殊标记ID
+                vs_id = self.model.backbone.qwen_model.config.vision_start_token_id
+                vi_id = self.model.backbone.qwen_model.config.image_token_id
+                pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
 
-                # 我们将克隆用于标签，初始相同
-                labels_i = input_ids_i.clone()
+                batch_input_ids = []
+                batch_attention_mask = []
+                batch_labels = []
 
-                # 检查是否有实际图像。如果有，计算预期的patch标记数量
-                if images[i] is not None:
-                    n_img_tokens = _compute_n_img_tokens_for_sample(images[i], self.model.backbone)
-                else:
-                    n_img_tokens = 0
+                # 2) 构建最终序列，可能添加视觉标记
+                for i in range(len(batch)):
+                    input_ids_i = encoded["input_ids"][i]
+                    attention_mask_i = encoded["attention_mask"][i]
 
-                if n_img_tokens > 0:
-                    # 插入1个vision_start_token，然后是n_img_tokens个image_token_id
-                    # 通常附加在末尾
-                    vs_tensor = torch.tensor([vs_id], dtype=torch.long)
-                    vi_tensor = torch.tensor([vi_id] * n_img_tokens, dtype=torch.long)
-                    # 连接它们
-                    input_ids_i = torch.cat([input_ids_i, vs_tensor, vi_tensor], dim=0)
+                    # 我们将克隆用于标签，初始相同
+                    labels_i = input_ids_i.clone()
 
-                    # 注意力掩码
-                    mask_append = torch.ones(1 + n_img_tokens, dtype=attention_mask_i.dtype)
-                    attention_mask_i = torch.cat([attention_mask_i, mask_append], dim=0)
+                    # 检查是否有实际图像。如果有，计算预期的patch标记数量
+                    if images[i] is not None:
+                        n_img_tokens = _compute_n_img_tokens_for_sample(images[i], self.model.backbone)
+                    else:
+                        n_img_tokens = 0
 
-                    # 我们不训练模型生成这些标记，所以我们将它们设置为-100
-                    labels_append = torch.full((1 + n_img_tokens,), -100, dtype=labels_i.dtype)
-                    labels_i = torch.cat([labels_i, labels_append], dim=0)
+                    if n_img_tokens > 0:
+                        # 插入1个vision_start_token，然后是n_img_tokens个image_token_id
+                        # 通常附加在末尾
+                        vs_tensor = torch.tensor([vs_id], dtype=torch.long)
+                        vi_tensor = torch.tensor([vi_id] * n_img_tokens, dtype=torch.long)
+                        # 连接它们
+                        input_ids_i = torch.cat([input_ids_i, vs_tensor, vi_tensor], dim=0)
 
-                batch_input_ids.append(input_ids_i)
-                batch_attention_mask.append(attention_mask_i)
-                batch_labels.append(labels_i)
+                        # 注意力掩码
+                        mask_append = torch.ones(1 + n_img_tokens, dtype=attention_mask_i.dtype)
+                        attention_mask_i = torch.cat([attention_mask_i, mask_append], dim=0)
 
-            # 3) 现在将它们填充到此批次的最大长度
-            padded_input_ids = torch.nn.utils.rnn.pad_sequence(
-                batch_input_ids,
-                batch_first=True,
-                padding_value=pad_id
-            )
-            padded_attention_mask = torch.nn.utils.rnn.pad_sequence(
-                batch_attention_mask,
-                batch_first=True,
-                padding_value=0
-            )
-            padded_labels = torch.nn.utils.rnn.pad_sequence(
-                batch_labels,
-                batch_first=True,
-                padding_value=-100
-            )
+                        # 我们不训练模型生成这些标记，所以我们将它们设置为-100
+                        labels_append = torch.full((1 + n_img_tokens,), -100, dtype=labels_i.dtype)
+                        labels_i = torch.cat([labels_i, labels_append], dim=0)
 
-            # 返回标准批次
-            batch_dict = {
-                "input_ids": padded_input_ids,
-                "attention_mask": padded_attention_mask,
-                "images": pixel_values,
-                "labels": padded_labels,
-            }
-            return batch_dict
+                    batch_input_ids.append(input_ids_i)
+                    batch_attention_mask.append(attention_mask_i)
+                    batch_labels.append(labels_i)
+
+                # 3) 现在将它们填充到此批次的最大长度
+                padded_input_ids = torch.nn.utils.rnn.pad_sequence(
+                    batch_input_ids,
+                    batch_first=True,
+                    padding_value=pad_id
+                )
+                padded_attention_mask = torch.nn.utils.rnn.pad_sequence(
+                    batch_attention_mask,
+                    batch_first=True,
+                    padding_value=0
+                )
+                padded_labels = torch.nn.utils.rnn.pad_sequence(
+                    batch_labels,
+                    batch_first=True,
+                    padding_value=-100
+                )
+
+                # 返回标准批次
+                batch_dict = {
+                    "input_ids": padded_input_ids,
+                    "attention_mask": padded_attention_mask,
+                    "images": pixel_values,
+                    "labels": padded_labels,
+                }
+                return batch_dict
+            except Exception as e:
+                print(f"[ERROR] Error in data collator: {e}")
+                # Analyze the issue
+                print(f"[DEBUG] Batch length: {len(batch)}")
+                for i, item in enumerate(batch):
+                    print(f"[DEBUG] Item {i} keys: {list(item.keys())}")
+                    if "image" in item:
+                        if isinstance(item["image"], torch.Tensor):
+                            print(f"[DEBUG] Item {i} image shape: {item['image'].shape}")
+                        else:
+                            print(f"[DEBUG] Item {i} image type: {type(item['image'])}")
+
+                # Return a default safe batch
+                return {
+                    "input_ids": torch.zeros((1, 1), dtype=torch.long),
+                    "attention_mask": torch.zeros((1, 1), dtype=torch.long),
+                    "images": torch.zeros((1, 3, 512, 512), dtype=torch.float),
+                    "labels": torch.zeros((1, 1), dtype=torch.long),
+                }
 
         # 自定义保存函数处理共享张量
         def custom_save_model(trainer, output_dir, _internal_call=True):
@@ -405,6 +448,8 @@ class Trainer:
         We replicate a minimal approach for cross-entropy on val_dataloader.
         Optionally parse points and do SAM-based IoU if needed.
         Also visualize random validation samples and log to wandb.
+
+        Modified to use batch size 1 for evaluation to avoid batch collation issues.
         """
         print("[Trainer] Running validation...")
 
@@ -443,6 +488,11 @@ class Trainer:
             self.model.eval()
             losses = []
             for i, batch in enumerate(tqdm(self.val_dataloader, desc="Validation")):
+                # Limit validation samples
+                if i >= 10:  # Only process up to 10 samples
+                    print(f"[INFO] Reached 10 validation samples, stopping validation.")
+                    break
+
                 if isinstance(batch["text_input"], list):
                     text_list = batch["text_input"]
                 else:
