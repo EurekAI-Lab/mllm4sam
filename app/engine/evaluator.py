@@ -3,7 +3,7 @@ import os
 import PIL
 import torch
 from torch import nn
-import tqdm
+from tqdm.auto import tqdm
 import matplotlib.pyplot as plt
 import numpy as np
 import wandb
@@ -11,11 +11,7 @@ import random
 from datetime import datetime
 
 from app.util.logger import compute_point_match, parse_points_from_text
-from app.util.metrics import compute_iou
-
-
-def compute_dice(param, param1):
-    pass
+from app.util.metrics import compute_iou, compute_dice
 
 
 class Evaluator:
@@ -58,24 +54,122 @@ class Evaluator:
                 else:
                     pixel_values = None
 
-                # 2. Compute text generation loss
+                # 2. Prepare inputs with proper image tokens
                 tokenizer = self.model.backbone.qwen_tokenizer
+
+                # Instead of directly tokenizing and forwarding, we need to handle image tokens properly
+                # This is similar to what's done in the data_collator in Trainer
+
+                # First tokenize the text
                 encoded = tokenizer(
                     text_list,
                     return_tensors="pt",
                     padding=True,
                     truncation=True,
-                    max_length=1536  # Adjust as needed
+                    max_length=1536
                 )
                 input_ids = encoded["input_ids"].to(self.device)
                 attention_mask = encoded["attention_mask"].to(self.device)
 
-                outputs = self.model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    images=pixel_values,
-                    labels=input_ids
-                )
+                # Get vision token IDs from model config
+                vision_start_token_id = self.model.backbone.qwen_model.config.vision_start_token_id
+                image_token_id = self.model.backbone.qwen_model.config.image_token_id
+
+                # Compute number of image tokens needed
+                if pixel_values is not None:
+                    # Extract grid dimensions
+                    batch_size, channels, height, width = pixel_values.shape
+                    patch_size = getattr(self.model.backbone, 'override_patch_size', 16)
+                    h_grid = height // patch_size
+                    w_grid = width // patch_size
+
+                    # Determine spatial_merge_size (default 2)
+                    spatial_merge_size = 2
+                    if hasattr(self.model.backbone.qwen_model.config, "vision_config"):
+                        vc = self.model.backbone.qwen_model.config.vision_config
+                        if hasattr(vc, "spatial_merge_size"):
+                            spatial_merge_size = vc.spatial_merge_size
+
+                    # Calculate number of image tokens after merging
+                    n_image_tokens = (h_grid * w_grid) // (spatial_merge_size * spatial_merge_size)
+
+                    # Calculate image grid THW for the model
+                    image_grid_thw = torch.tensor(
+                        [[1, h_grid, w_grid] for _ in range(batch_size)],
+                        device=self.device,
+                        dtype=torch.long
+                    )
+
+                    # Now append vision tokens to input_ids and update attention_mask
+                    batch_input_ids = []
+                    batch_attention_mask = []
+                    batch_labels = []
+
+                    for i in range(batch_size):
+                        # Append vision_start_token_id followed by n_image_tokens of image_token_id
+                        new_input_ids = torch.cat([
+                            input_ids[i],
+                            torch.tensor([vision_start_token_id], device=self.device),
+                            torch.tensor([image_token_id] * n_image_tokens, device=self.device)
+                        ])
+
+                        # Update attention mask
+                        new_attention_mask = torch.cat([
+                            attention_mask[i],
+                            torch.ones(1 + n_image_tokens, device=self.device, dtype=attention_mask.dtype)
+                        ])
+
+                        # For labels, mark vision tokens as -100 to ignore in loss
+                        new_labels = torch.cat([
+                            input_ids[i],  # Use input_ids as labels for text tokens
+                            torch.full((1 + n_image_tokens,), -100, device=self.device, dtype=torch.long)
+                        ])
+
+                        batch_input_ids.append(new_input_ids)
+                        batch_attention_mask.append(new_attention_mask)
+                        batch_labels.append(new_labels)
+
+                    # Pad sequences to max length in batch
+                    max_len = max(len(ids) for ids in batch_input_ids)
+                    padded_input_ids = []
+                    padded_attention_mask = []
+                    padded_labels = []
+
+                    for i in range(batch_size):
+                        padding_len = max_len - len(batch_input_ids[i])
+                        padded_input_ids.append(torch.cat([
+                            batch_input_ids[i],
+                            torch.full((padding_len,), tokenizer.pad_token_id, device=self.device, dtype=torch.long)
+                        ]))
+                        padded_attention_mask.append(torch.cat([
+                            batch_attention_mask[i],
+                            torch.zeros(padding_len, device=self.device, dtype=attention_mask.dtype)
+                        ]))
+                        padded_labels.append(torch.cat([
+                            batch_labels[i],
+                            torch.full((padding_len,), -100, device=self.device, dtype=torch.long)
+                        ]))
+
+                    # Stack tensors
+                    input_ids = torch.stack(padded_input_ids)
+                    attention_mask = torch.stack(padded_attention_mask)
+                    labels = torch.stack(padded_labels)
+
+                    # Now call the model with the properly prepared inputs
+                    outputs = self.model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        images=pixel_values,
+                        image_grid_thw=image_grid_thw,
+                        labels=labels
+                    )
+                else:
+                    # Text-only case
+                    outputs = self.model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        labels=input_ids
+                    )
 
                 loss_val = outputs.loss.item() if hasattr(outputs, "loss") else outputs[0].item()
                 metrics["loss"].append(loss_val)
@@ -94,14 +188,68 @@ class Evaluator:
                     max_length=1536
                 ).to(self.device)
 
-                # Generate responses
-                gen_ids = self.model.generate(
-                    input_ids=prompt_ids.input_ids,
-                    attention_mask=prompt_ids.attention_mask,
-                    images=pixel_values,
-                    max_new_tokens=128,
-                    do_sample=False
-                )
+                # For generation, we'll use a similar approach to ensure correct image token handling
+                batch_size = prompt_ids.input_ids.shape[0]
+
+                if pixel_values is not None:
+                    # For generation we need to append vision tokens to the prompt
+                    batch_prompt_ids = []
+                    batch_prompt_attn = []
+
+                    for i in range(batch_size):
+                        # Append vision_start_token_id followed by n_image_tokens of image_token_id
+                        new_prompt_ids = torch.cat([
+                            prompt_ids.input_ids[i],
+                            torch.tensor([vision_start_token_id], device=self.device),
+                            torch.tensor([image_token_id] * n_image_tokens, device=self.device)
+                        ])
+
+                        # Update attention mask
+                        new_prompt_attn = torch.cat([
+                            prompt_ids.attention_mask[i],
+                            torch.ones(1 + n_image_tokens, device=self.device, dtype=prompt_ids.attention_mask.dtype)
+                        ])
+
+                        batch_prompt_ids.append(new_prompt_ids)
+                        batch_prompt_attn.append(new_prompt_attn)
+
+                    # Pad sequences to max length in batch
+                    max_len = max(len(ids) for ids in batch_prompt_ids)
+                    padded_prompt_ids = []
+                    padded_prompt_attn = []
+
+                    for i in range(batch_size):
+                        padding_len = max_len - len(batch_prompt_ids[i])
+                        padded_prompt_ids.append(torch.cat([
+                            batch_prompt_ids[i],
+                            torch.full((padding_len,), tokenizer.pad_token_id, device=self.device, dtype=torch.long)
+                        ]))
+                        padded_prompt_attn.append(torch.cat([
+                            batch_prompt_attn[i],
+                            torch.zeros(padding_len, device=self.device, dtype=prompt_ids.attention_mask.dtype)
+                        ]))
+
+                    # Stack tensors
+                    gen_input_ids = torch.stack(padded_prompt_ids)
+                    gen_attention_mask = torch.stack(padded_prompt_attn)
+
+                    # Generate responses
+                    gen_ids = self.model.generate(
+                        input_ids=gen_input_ids,
+                        attention_mask=gen_attention_mask,
+                        images=pixel_values,
+                        image_grid_thw=image_grid_thw,
+                        max_new_tokens=128,
+                        do_sample=False
+                    )
+                else:
+                    # Text-only generation
+                    gen_ids = self.model.generate(
+                        input_ids=prompt_ids.input_ids,
+                        attention_mask=prompt_ids.attention_mask,
+                        max_new_tokens=128,
+                        do_sample=False
+                    )
 
                 # Decode generated text
                 gen_texts = tokenizer.batch_decode(gen_ids, skip_special_tokens=True)
@@ -213,8 +361,6 @@ class Evaluator:
             val_samples (list): List of validation samples with images, masks, and points
             num_samples (int): Number of random samples to visualize
         """
-
-
         # If we have fewer samples than requested, use all available samples
         num_samples = min(num_samples, len(val_samples))
         if num_samples == 0:

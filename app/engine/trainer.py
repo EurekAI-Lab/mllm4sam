@@ -21,8 +21,26 @@ from app.util.utils import set_seed, ensure_dir
 from app.engine.evaluator import Evaluator
 
 from trl import SFTTrainer, SFTConfig
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, TrainerCallback
 from torch.utils.data import Dataset
+
+
+class ValidationCallback(TrainerCallback):
+    """
+    自定义回调函数，在训练过程中定期运行验证。
+    会调用父级Trainer的_eval_validation方法。
+    """
+
+    def __init__(self, trainer):
+        self.trainer = trainer
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if state.global_step % self.trainer.sft_config.eval_steps == 0:
+            print(f"[INFO] 在步骤 {state.global_step} 运行验证")
+            # 更新全局步数用于日志
+            self.trainer.global_step = state.global_step
+            # 运行验证
+            self.trainer._eval_validation()
 
 
 class Trainer:
@@ -64,7 +82,7 @@ class Trainer:
         self.train_dataloader = train_dataloader
         self.val_dataloader = val_dataloader
 
-        # Basic hyperparams
+        # 基本超参数
         self.lr = lr
         self.max_epochs = max_epochs
         self.grad_acc_steps = grad_acc_steps
@@ -81,10 +99,10 @@ class Trainer:
         self.run_dir = os.path.join(self.output_dir, f"{run_name}_{dt_string}")
         ensure_dir(self.run_dir)
 
-        # Setup wandb
+        # 设置wandb
         wandb.init(project="SAM4MLLM", name=run_name, dir=self.run_dir)
 
-        # Logging CSV
+        # 日志CSV
         self.train_log_path = os.path.join(self.run_dir, "train_log.csv")
         self.val_log_path = os.path.join(self.run_dir, "val_log.csv")
         with open(self.train_log_path, "w", newline='') as f:
@@ -94,10 +112,10 @@ class Trainer:
             writer = csv.writer(f)
             writer.writerow(["step", "epoch", "val_loss"])
 
-        # Create a TRL SFT config
+        # 创建TRL SFT配置
         self.sft_config = SFTConfig(
             num_train_epochs=max_epochs,
-            per_device_train_batch_size=1,  # We'll pass actual batch via our custom logic if needed
+            per_device_train_batch_size=1,  # 我们会通过自定义逻辑传递实际批次
             per_device_eval_batch_size=1,
             gradient_accumulation_steps=grad_acc_steps,
             max_seq_length=1536,
@@ -106,51 +124,54 @@ class Trainer:
             warmup_ratio=0.0,
             output_dir=self.run_dir,
             logging_steps=10,
-            eval_steps=50,
+            eval_steps=50,  # 每50步运行一次验证
             save_steps=200,
             dataset_kwargs={"skip_prepare_dataset": True},
-            remove_unused_columns=False,  # Keep 'text_input' / 'image' keys
-            save_safetensors=False,  # To avoid shared tensor issues with safetensors
+            remove_unused_columns=False,  # 保留'text_input'/'image'键
+            save_safetensors=False,  # 避免safetensors共享张量问题
         )
 
-        # Prepare evaluator (placeholder)
+        # 准备评估器
         self.evaluator = Evaluator(self.model, self.device) if self.val_dataloader else None
 
-        # Global step tracking
+        # 全局步数跟踪
         self.global_step = 0
         self.best_val_loss = float("inf")
         self.epochs_no_improve = 0
         self.should_stop = False
 
-        # Move model to device
+        # 将模型移至设备
         self.model.to(self.device)
+
 
     def train(self):
         """
-        We create a SFTTrainer from TRL and feed it the existing train and val dataset.
-        We'll rely on SFTTrainer's standard train() loop for advanced SFT logic.
-        We keep your prior code's style of logging and shape debugging as is.
+        我们创建TRL的SFTTrainer并提供现有的训练和验证数据集。
+        我们依赖SFTTrainer的标准train()循环来实现高级SFT逻辑。
+        我们保留了您之前代码的日志记录和形状调试风格。
+
+        添加了ValidationCallback以在训练过程中定期运行验证。
         """
 
-        print("[Trainer] Creating TRL SFTTrainer...")
+        print("[Trainer] 创建TRL SFTTrainer...")
 
         def _compute_n_img_tokens_for_sample(img_tensor: torch.Tensor, backbone) -> int:
             """
-            Computes how many final patch tokens Qwen2-VL will produce for a single image
-            given the user-specified patch_size, temporal_patch_size, and spatial_merge_size.
+            计算Qwen2-VL为单个图像生成的最终patch标记数量
+            基于用户指定的patch_size、temporal_patch_size和spatial_merge_size。
 
-            For example, for a 512×512 image with patch_size=16, spatial_merge_size=2,
-            temporal_patch_size=1 => final 256 tokens.
+            例如，对于512×512的图像，patch_size=16，spatial_merge_size=2，
+            temporal_patch_size=1 => 最终256个标记。
             """
             if img_tensor is None or img_tensor.shape[0] == 0:
                 return 0
 
-            # shape = [channels, H, W]
+            # 形状 = [channels, H, W]
             _, h, w = img_tensor.shape
             patch_size = getattr(backbone, 'override_patch_size', 14)
             temporal_patch_size = getattr(backbone, 'override_temporal_patch_size', 1)
 
-            # Attempt to read from vision_config as well, if it exists
+            # 尝试从vision_config读取，如果存在
             if hasattr(backbone.qwen_model.config, "vision_config"):
                 vc = backbone.qwen_model.config.vision_config
                 if hasattr(vc, "spatial_merge_size"):
@@ -160,44 +181,44 @@ class Trainer:
             else:
                 spatial_merge = 2
 
-            # T x (H//patch_size) x (W//patch_size), then / (spatial_merge^2)
-            t_count = temporal_patch_size  # for a single image
+            # T x (H//patch_size) x (W//patch_size)，然后 / (spatial_merge^2)
+            t_count = temporal_patch_size  # 对于单个图像
             h_count = h // patch_size
             w_count = w // patch_size
             total_patches = t_count * h_count * w_count
             merged_count = total_patches // (spatial_merge * spatial_merge)
             return merged_count
 
-        # This custom collator handles text + images from your dataset
+        # 此自定义收集器处理来自数据集的文本+图像
         def my_data_collator(batch):
             """
-            Each element in 'batch' is a dict with keys:
+            批次中的每个元素是具有以下键的dict：
               "text_input", "image", "points_str"
-            We'll tokenize 'text_input' using Qwen tokenizer,
-            then if images is present, we'll add the correct # of vision tokens:
-              - 1 vision_start_token_id
-              - repeated image_token_id (match final patch count).
-            We'll also adjust `labels` so that appended tokens have label=-100.
+            我们将使用Qwen分词器对'text_input'进行分词，
+            然后如果存在images，我们将添加正确数量的视觉标记：
+              - 1个vision_start_token_id
+              - 重复的image_token_id（匹配最终patch数量）。
+            我们还将调整`labels`，使附加标记的标签=-100。
             """
             text_list = [item["text_input"] for item in batch]
             images = [item["image"] for item in batch]
 
-            # Qwen's tokenizer
+            # Qwen的分词器
             tokenizer = self.model.backbone.qwen_tokenizer
 
-            # 1) Basic text tokenization
+            # 1) 基本文本分词
             encoded = tokenizer(
                 text_list,
-                padding=False,  # We'll pad manually below
+                padding=False,  # 我们将在下面手动填充
                 truncation=True,
                 max_length=self.sft_config.max_seq_length,
                 return_tensors="pt",
             )
 
-            # Convert images to float
+            # 将图像转换为浮点数
             pixel_values = torch.stack(images, dim=0).float()
 
-            # Identify special token IDs from config
+            # 从配置中识别特殊标记ID
             vs_id = self.model.backbone.qwen_model.config.vision_start_token_id
             vi_id = self.model.backbone.qwen_model.config.image_token_id
             pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
@@ -206,33 +227,33 @@ class Trainer:
             batch_attention_mask = []
             batch_labels = []
 
-            # 2) Build final sequences, possibly adding vision tokens
+            # 2) 构建最终序列，可能添加视觉标记
             for i in range(len(batch)):
                 input_ids_i = encoded["input_ids"][i]
                 attention_mask_i = encoded["attention_mask"][i]
 
-                # We'll clone for labels, initially identical
+                # 我们将克隆用于标签，初始相同
                 labels_i = input_ids_i.clone()
 
-                # Check if there's an actual image. If so, compute how many patch tokens are expected
+                # 检查是否有实际图像。如果有，计算预期的patch标记数量
                 if images[i] is not None:
                     n_img_tokens = _compute_n_img_tokens_for_sample(images[i], self.model.backbone)
                 else:
                     n_img_tokens = 0
 
                 if n_img_tokens > 0:
-                    # Insert 1 vision_start_token, then n_img_tokens of image_token_id
-                    # Typically appended at the end
+                    # 插入1个vision_start_token，然后是n_img_tokens个image_token_id
+                    # 通常附加在末尾
                     vs_tensor = torch.tensor([vs_id], dtype=torch.long)
                     vi_tensor = torch.tensor([vi_id] * n_img_tokens, dtype=torch.long)
-                    # Concat them
+                    # 连接它们
                     input_ids_i = torch.cat([input_ids_i, vs_tensor, vi_tensor], dim=0)
 
-                    # For attention mask
+                    # 注意力掩码
                     mask_append = torch.ones(1 + n_img_tokens, dtype=attention_mask_i.dtype)
                     attention_mask_i = torch.cat([attention_mask_i, mask_append], dim=0)
 
-                    # We do not train the model to generate these tokens, so we set them to -100
+                    # 我们不训练模型生成这些标记，所以我们将它们设置为-100
                     labels_append = torch.full((1 + n_img_tokens,), -100, dtype=labels_i.dtype)
                     labels_i = torch.cat([labels_i, labels_append], dim=0)
 
@@ -240,7 +261,7 @@ class Trainer:
                 batch_attention_mask.append(attention_mask_i)
                 batch_labels.append(labels_i)
 
-            # 3) Now pad them to max length in this batch
+            # 3) 现在将它们填充到此批次的最大长度
             padded_input_ids = torch.nn.utils.rnn.pad_sequence(
                 batch_input_ids,
                 batch_first=True,
@@ -257,7 +278,7 @@ class Trainer:
                 padding_value=-100
             )
 
-            # Return a standard batch
+            # 返回标准批次
             batch_dict = {
                 "input_ids": padded_input_ids,
                 "attention_mask": padded_attention_mask,
@@ -266,87 +287,87 @@ class Trainer:
             }
             return batch_dict
 
-        # Custom save function to handle shared tensors
+        # 自定义保存函数处理共享张量
         def custom_save_model(trainer, output_dir, _internal_call=True):
             """
-            Custom save_model implementation that handles shared tensors properly.
-            This replaces the default SFTTrainer's save_model to avoid safetensors errors.
+            处理共享张量的自定义save_model实现。
+            这替换了默认SFTTrainer的save_model以避免safetensors错误。
             """
             from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
 
             os.makedirs(output_dir, exist_ok=True)
-            print(f"[INFO] Saving model checkpoint to {output_dir}")
+            print(f"[INFO] 保存模型检查点到 {output_dir}")
 
-            # Save the model state dict with proper handling of shared tensors
-            # For LoRA or PEFT models, use PEFT-specific saving
+            # 保存模型状态字典，正确处理共享张量
+            # 对于LoRA或PEFT模型，使用PEFT特定保存
             if hasattr(self.model, 'backbone') and hasattr(self.model.backbone, 'qwen_model'):
-                # Save Qwen model and SAM model separately
+                # 分别保存Qwen模型和SAM模型
                 if hasattr(self.model.backbone, 'qwen_model'):
                     qwen_output_dir = os.path.join(output_dir, "qwen")
                     os.makedirs(qwen_output_dir, exist_ok=True)
-                    print(f"[INFO] Saving Qwen model to {qwen_output_dir}")
+                    print(f"[INFO] 保存Qwen模型到 {qwen_output_dir}")
 
-                    # Check if the model is a PEFT model
+                    # 检查模型是否为PEFT模型
                     if hasattr(self.model.backbone.qwen_model, 'save_pretrained'):
-                        # For PEFT models, only save the PEFT model adapter
+                        # 对于PEFT模型，仅保存PEFT模型适配器
                         if hasattr(self.model.backbone.qwen_model, 'peft_config'):
-                            print(f"[INFO] Detected PEFT model, saving adapters")
+                            print(f"[INFO] 检测到PEFT模型，保存适配器")
                             self.model.backbone.qwen_model.save_pretrained(qwen_output_dir)
                         else:
-                            # For full models, save with PyTorch's save to avoid safetensors errors
-                            print(f"[INFO] Saving full model with PyTorch")
+                            # 对于完整模型，使用PyTorch的save以避免safetensors错误
+                            print(f"[INFO] 使用PyTorch保存完整模型")
                             torch.save(
                                 self.model.backbone.qwen_model.state_dict(),
                                 os.path.join(qwen_output_dir, "pytorch_model.bin")
                             )
-                            # Save config as well
+                            # 同时保存配置
                             if hasattr(self.model.backbone.qwen_model, 'config'):
                                 self.model.backbone.qwen_model.config.save_pretrained(qwen_output_dir)
 
-                    # Save tokenizer
+                    # 保存分词器
                     if hasattr(self.model.backbone, 'qwen_tokenizer'):
                         self.model.backbone.qwen_tokenizer.save_pretrained(qwen_output_dir)
 
-                # Save SAM model if present
+                # 如果存在，保存SAM模型
                 if hasattr(self.model.backbone, 'sam_model') and self.model.backbone.sam_model is not None:
                     sam_output_dir = os.path.join(output_dir, "sam")
                     os.makedirs(sam_output_dir, exist_ok=True)
-                    print(f"[INFO] Saving SAM model to {sam_output_dir}")
+                    print(f"[INFO] 保存SAM模型到 {sam_output_dir}")
 
                     if hasattr(self.model.backbone.sam_model, 'save_pretrained'):
                         self.model.backbone.sam_model.save_pretrained(sam_output_dir)
                     else:
-                        # Use PyTorch's save
+                        # 使用PyTorch的save
                         torch.save(
                             self.model.backbone.sam_model.state_dict(),
                             os.path.join(sam_output_dir, "pytorch_model.bin")
                         )
-                        # Save config if available
+                        # 如果可用，保存配置
                         if hasattr(self.model.backbone.sam_model, 'config'):
                             self.model.backbone.sam_model.config.save_pretrained(sam_output_dir)
 
-                # Save overview file to help with reloading
+                # 保存概览文件以帮助重新加载
                 overview_path = os.path.join(output_dir, "model_overview.txt")
                 with open(overview_path, "w") as f:
-                    f.write("SAM4MLLM Model Components:\n")
+                    f.write("SAM4MLLM 模型组件:\n")
                     if hasattr(self.model.backbone, 'qwen_model'):
-                        f.write(f"- Qwen Model: {type(self.model.backbone.qwen_model).__name__}\n")
+                        f.write(f"- Qwen 模型: {type(self.model.backbone.qwen_model).__name__}\n")
                         if hasattr(self.model.backbone.qwen_model, 'peft_config'):
-                            f.write("  - Uses PEFT/LoRA adapters\n")
+                            f.write("  - 使用 PEFT/LoRA 适配器\n")
                     if hasattr(self.model.backbone, 'sam_model'):
-                        f.write(f"- SAM Model: {type(self.model.backbone.sam_model).__name__}\n")
+                        f.write(f"- SAM 模型: {type(self.model.backbone.sam_model).__name__}\n")
             else:
-                # Fallback for simpler models - use PyTorch save
-                print(f"[INFO] Using PyTorch save for model without recognized backbone structure")
+                # 更简单模型的后备方案 - 使用PyTorch保存
+                print(f"[INFO] 对于没有识别到的骨干结构的模型，使用PyTorch保存")
                 torch.save(
                     self.model.state_dict(),
                     os.path.join(output_dir, "pytorch_model.bin")
                 )
 
-            print(f"[INFO] Model checkpoint saved successfully to {output_dir}")
+            print(f"[INFO] 模型检查点成功保存到 {output_dir}")
             return output_dir
 
-        # Create and initialize SFT trainer
+        # 创建并初始化SFT训练器
         sft_trainer = SFTTrainer(
             model=self.model,
             args=self.sft_config,
@@ -355,24 +376,29 @@ class Trainer:
             data_collator=my_data_collator,
         )
 
-        # Replace the save_model method to handle shared tensors correctly
+        # 替换save_model方法以正确处理共享张量
         sft_trainer.save_model = lambda output_dir, _internal_call=True: custom_save_model(
             sft_trainer, output_dir, _internal_call
         )
 
-        print("[Trainer] Start SFT training with TRL SFTTrainer...")
-        sft_trainer.train()  # The standard training loop from TRL
-
-        # After training, let's do final validation with your old approach if desired
+        # 添加验证回调以在训练期间定期运行
         if self.val_dataloader is not None:
-            print("[Trainer] Doing final validation pass with your code.")
-            val_loss = self._eval_validation()
-            print(f"[Trainer] Final val loss: {val_loss}")
+            print("[Trainer] 添加ValidationCallback用于训练期间的定期验证")
+            sft_trainer.add_callback(ValidationCallback(self))
 
-        # Save final model with our custom save function
+        print("[Trainer] 开始使用TRL SFTTrainer进行SFT训练...")
+        sft_trainer.train()  # TRL的标准训练循环
+
+        # 训练后，如果需要，用您原来的方法进行最终验证
+        if self.val_dataloader is not None:
+            print("[Trainer] 用您的代码进行最终验证。")
+            val_loss = self._eval_validation()
+            print(f"[Trainer] 最终验证损失: {val_loss}")
+
+        # 用我们的自定义保存函数保存最终模型
         final_model_path = os.path.join(self.run_dir, "final_model")
         custom_save_model(sft_trainer, final_model_path)
-        print(f"[Trainer] SFT training complete. Model saved at {final_model_path}")
+        print(f"[Trainer] SFT训练完成。模型保存在 {final_model_path}")
 
     def _eval_validation(self):
         """
