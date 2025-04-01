@@ -371,3 +371,183 @@ class QwenSamBackbone(nn.Module):
 
         return outputs
 
+    def predict_segmentation(self, image, text=None, prompt=None, return_points=False):
+        """
+        End-to-end inference pipeline:
+        1. Generate point coordinates using Qwen2-VL
+        2. Pass the points to SAM for segmentation
+
+        Args:
+            image (torch.Tensor or PIL.Image): Input image [3, H, W] or PIL Image
+            text (str, optional): Text context for point prediction. If None, uses default prompt.
+            prompt (str, optional): Specific prompt for point generation. Overrides text if provided.
+            return_points (bool): Whether to return the predicted points along with mask.
+
+        Returns:
+            dict: {
+                'mask': Binary segmentation mask of shape [H, W],
+                'points': List of [x, y] coordinates (if return_points=True)
+                'confidence': SAM confidence score
+            }
+        """
+        # Prepare image if needed
+        if not isinstance(image, torch.Tensor):
+            # Convert PIL to tensor
+            if hasattr(self.qwen_processor, "image_processor"):
+                # Use processor if available
+                pixel_values = self.qwen_processor.image_processor(image, return_tensors="pt").pixel_values
+                pixel_values = pixel_values.to(self.device)
+            else:
+                # Simple conversion
+                import numpy as np
+                from torchvision import transforms
+                transform = transforms.Compose([
+                    transforms.ToTensor(),
+                    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+                ])
+                pixel_values = transform(image).unsqueeze(0).to(self.device)
+        else:
+            # Ensure tensor is batched and on the right device
+            pixel_values = image.unsqueeze(0) if image.dim() == 3 else image
+            pixel_values = pixel_values.to(self.device)
+
+        # 1) Generate point coordinates using Qwen2-VL
+        if prompt is None:
+            if text is None:
+                # Default prompt if nothing is provided
+                prompt = "Point out the wound area in up to 10 points. Answer only with coordinates in format (x,y)."
+            else:
+                # If text context is provided but no specific prompt
+                prompt = f"{text}\nPoint out the wound area in up to 10 points. Answer only with coordinates in format (x,y)."
+
+        # Tokenize the prompt
+        tokenized_prompt = self.qwen_tokenizer([prompt], return_tensors="pt").to(self.device)
+
+        # Run text generation to get point coordinates
+        with torch.no_grad():
+            generated_ids = self.generate(
+                input_ids=tokenized_prompt.input_ids,
+                attention_mask=tokenized_prompt.attention_mask,
+                images=pixel_values,
+                max_new_tokens=128,
+                temperature=0.2,  # Lower temperature for more deterministic outputs
+                do_sample=False,  # Greedy decoding for coordinates
+                num_beams=1
+            )
+
+            # Decode the generated text
+            generated_text = self.qwen_tokenizer.decode(generated_ids[0], skip_special_tokens=True)
+
+            # Extract the model's response (after the prompt)
+            response = generated_text.split(prompt)[-1].strip()
+
+            # Parse coordinates using improved parser
+            points = self._parse_coordinates_from_text(response)
+
+            # If no points were found, return empty result
+            if len(points) == 0:
+                print(f"[WARNING] No valid coordinates found in model output: {response}")
+                if return_points:
+                    return {"mask": None, "points": [], "confidence": 0.0}
+                return {"mask": None, "confidence": 0.0}
+
+        # 2) Pass points to SAM for segmentation
+        if self.sam_model is not None and self.sam_processor is not None:
+            # Convert to SAM's expected format
+            input_points = torch.tensor([points], dtype=torch.float).to(self.device)
+            input_labels = torch.ones(input_points.shape[:2], dtype=torch.int).to(self.device)
+
+            # Ensure image is in right format for SAM (might need to resize or normalize)
+            if hasattr(self.sam_processor, "resize_longest_size"):
+                # Convert the tensor to a PIL Image for SAM processing
+                from PIL import Image
+                import numpy as np
+
+                # Denormalize and convert to PIL
+                img = pixel_values[0].cpu().permute(1, 2, 0).numpy()
+                img = (img * 255).astype(np.uint8)
+                pil_img = Image.fromarray(img)
+
+                # Process with SAM processor
+                sam_inputs = self.sam_processor(
+                    images=pil_img,
+                    input_points=points,
+                    return_tensors="pt"
+                )
+
+                sam_inputs = {k: v.to(self.device) for k, v in sam_inputs.items() if isinstance(v, torch.Tensor)}
+
+                # Generate mask with SAM
+                with torch.no_grad():
+                    sam_outputs = self.sam_model(**sam_inputs)
+                    masks = sam_outputs.pred_masks.squeeze().cpu().numpy()
+                    scores = sam_outputs.iou_scores.squeeze().cpu().numpy()
+
+                # Get the best mask
+                if masks.ndim == 3:
+                    best_mask_idx = scores.argmax()
+                    mask = masks[best_mask_idx]
+                    confidence = scores[best_mask_idx]
+                else:
+                    mask = masks
+                    confidence = scores.item() if hasattr(scores, 'item') else scores
+
+                # Return results
+                result = {"mask": mask, "confidence": confidence}
+                if return_points:
+                    result["points"] = points
+
+                return result
+            else:
+                print("[WARNING] SAM processor doesn't have the expected interface.")
+                if return_points:
+                    return {"mask": None, "points": points, "confidence": 0.0}
+                return {"mask": None, "confidence": 0.0}
+        else:
+            print("[WARNING] SAM model or processor not available. Returning only points.")
+            if return_points:
+                return {"mask": None, "points": points, "confidence": 0.0}
+            return {"mask": None, "confidence": 0.0}
+
+    def _parse_coordinates_from_text(self, text):
+        """
+        Enhanced coordinate parser that's more robust to different formats.
+
+        Args:
+            text (str): Generated text to parse coordinates from
+
+        Returns:
+            list: List of [x, y] point coordinates
+        """
+        import re
+
+        # Regular expressions for different coordinate formats
+        patterns = [
+            r"\(\s*(\d+)\s*,\s*(\d+)\s*\)",  # (x,y)
+            r"(\d+)\s*,\s*(\d+)",  # x,y
+            r"x\s*=\s*(\d+)\s*,\s*y\s*=\s*(\d+)",  # x=x, y=y
+            r"X\s*=\s*(\d+)\s*,\s*Y\s*=\s*(\d+)",  # X=x, Y=y
+        ]
+
+        points = []
+        for pattern in patterns:
+            matches = re.findall(pattern, text)
+            for match in matches:
+                try:
+                    x, y = int(match[0]), int(match[1])
+                    # Basic bounds check (adjust bounds as needed)
+                    if 0 <= x < 4096 and 0 <= y < 4096:  # Arbitrary large limit
+                        points.append([x, y])
+                except (ValueError, IndexError):
+                    continue
+
+        # Remove duplicates while preserving order
+        seen = set()
+        unique_points = []
+        for point in points:
+            point_tuple = tuple(point)
+            if point_tuple not in seen:
+                seen.add(point_tuple)
+                unique_points.append(point)
+
+        return unique_points[:10]  # Limit to 10 points max
