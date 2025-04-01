@@ -89,7 +89,7 @@ class Trainer:
         self.val_log_path = os.path.join(self.run_dir, "val_log.csv")
         with open(self.train_log_path, "w", newline='') as f:
             writer = csv.writer(f)
-            writer.writerow(["step", "epoch", "loss", "lr"])
+            writer.writerow(["step", "epoch", "val_loss", "val_point_match", "val_iou", "val_dice"])
         with open(self.val_log_path, "w", newline='') as f:
             writer = csv.writer(f)
             writer.writerow(["step", "epoch", "val_loss"])
@@ -378,42 +378,86 @@ class Trainer:
         """
         We replicate a minimal approach for cross-entropy on val_dataloader.
         Optionally parse points and do SAM-based IoU if needed.
+        Also visualize random validation samples and log to wandb.
         """
+        print("[Trainer] Running validation...")
 
-        self.model.eval()
-        losses = []
-        for i, batch in enumerate(tqdm(self.val_dataloader, desc="Validation")):
-            if isinstance(batch["text_input"], list):
-                text_list = batch["text_input"]
-            else:
-                text_list = [batch["text_input"]]
+        # Create a specific output directory for validation visualizations
+        val_viz_dir = os.path.join(self.run_dir, "validation_viz")
+        ensure_dir(val_viz_dir)
 
-            images = batch["image"]
-            if isinstance(images, torch.Tensor):
-                pixel_values = images.to(self.device)
-            else:
-                pixel_values = None
+        # Set visualization output directory for evaluator
+        if self.evaluator:
+            self.evaluator.output_dir = val_viz_dir
+            # Perform full evaluation with visualizations
+            eval_results = self.evaluator.evaluate(self.val_dataloader)
+            val_loss = eval_results.get("loss", 0.0)
 
-            encoded = self.model.backbone.qwen_tokenizer(
-                text_list,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                max_length=self.sft_config.max_seq_length
-            )
-            input_ids = encoded["input_ids"].to(self.device)
-            attention_mask = encoded["attention_mask"].to(self.device)
+            # Log all metrics to wandb
+            wandb.log({
+                "val_loss": val_loss,
+                "val_point_match": eval_results.get("point_match", 0.0),
+                "val_iou": eval_results.get("iou", 0.0),
+                "val_dice": eval_results.get("dice", 0.0),
+            })
 
-            with torch.no_grad():
-                outputs = self.model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    images=pixel_values,
-                    labels=input_ids,  # standard cross-entropy
+            # Log to CSV
+            with open(self.val_log_path, "a", newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    self.global_step,
+                    self.global_step // len(self.train_dataloader),
+                    val_loss,
+                    eval_results.get("point_match", 0.0),
+                    eval_results.get("iou", 0.0),
+                    eval_results.get("dice", 0.0)
+                ])
+        else:
+            # Fallback to simple loss calculation
+            self.model.eval()
+            losses = []
+            for i, batch in enumerate(tqdm(self.val_dataloader, desc="Validation")):
+                if isinstance(batch["text_input"], list):
+                    text_list = batch["text_input"]
+                else:
+                    text_list = [batch["text_input"]]
+
+                images = batch["image"]
+                if isinstance(images, torch.Tensor):
+                    pixel_values = images.to(self.device)
+                else:
+                    pixel_values = None
+
+                encoded = self.model.backbone.qwen_tokenizer(
+                    text_list,
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                    max_length=self.sft_config.max_seq_length
                 )
-                loss_val = outputs.loss if hasattr(outputs, "loss") else outputs[0]
-                losses.append(loss_val.item())
+                input_ids = encoded["input_ids"].to(self.device)
+                attention_mask = encoded["attention_mask"].to(self.device)
 
-        val_loss = sum(losses) / len(losses) if len(losses) > 0 else 0.0
-        wandb.log({"val_loss": val_loss})
+                with torch.no_grad():
+                    outputs = self.model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        images=pixel_values,
+                        labels=input_ids,  # standard cross-entropy
+                    )
+                    loss_val = outputs.loss if hasattr(outputs, "loss") else outputs[0]
+                    losses.append(loss_val.item())
+
+            val_loss = sum(losses) / len(losses) if len(losses) > 0 else 0.0
+            wandb.log({"val_loss": val_loss})
+
+            # Log to CSV
+            with open(self.val_log_path, "a", newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    self.global_step,
+                    self.global_step // len(self.train_dataloader),
+                    val_loss
+                ])
+
         return val_loss
